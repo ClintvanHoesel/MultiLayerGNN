@@ -1,0 +1,39 @@
+{
+  "os":  "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "python":  "CPython 3.13.5",
+  "startedAt":  "2026-05-05T13:21:22.987901Z",
+  "program":  "/home/clint/MultiLayerGNN/notebooks/main.ipynb",
+  "codePath":  "/home/clint/MultiLayerGNN/notebooks/main.ipynb",
+  "codePathLocal":  "main.ipynb",
+  "git":  {
+    "remote":  "git@github.com:ClintvanHoesel/MultiLayerGNN.git",
+    "commit":  "6c500f6645b3034a23742b93be31de6546fb9f97"
+  },
+  "email":  "clintvanhoesel@gmail.com",
+  "root":  ".",
+  "host":  "ClintPC2025",
+  "executable":  "/home/clint/miniforge3/envs/pyt/bin/python",
+  "cpu_count":  12,
+  "cpu_count_logical":  24,
+  "gpu":  "NVIDIA GeForce RTX 5060 Ti",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "1081101176832",
+      "used":  "67749670912"
+    }
+  },
+  "memory":  {
+    "total":  "33166614528"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce RTX 5060 Ti",
+      "memoryTotal":  "17103323136",
+      "architecture":  "Blackwell",
+      "uuid":  "GPU-56d05577-0838-8576-f1a7-c2fb5bd21ce9"
+    }
+  ],
+  "cudaVersion":  "13.1",
+  "writerId":  "clkxknhysoti7ihgthqgpor3azkupk1x"
+}

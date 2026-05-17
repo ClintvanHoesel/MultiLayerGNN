@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: morphology_gnn
+Version: 0.1.0
+Summary: GNN for molecular property prediction in morphology.
+Author: clint
+Author-email: clinthoeselvan@hotmail.com
+License-File: LICENSE
+Requires-Dist: torch>=2.6.0
+Requires-Dist: torch-geometric>=2.6.0
+Requires-Dist: scipy>=1.16.3
+Requires-Dist: numpy>=2.2.6
+Dynamic: author
+Dynamic: author-email
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary

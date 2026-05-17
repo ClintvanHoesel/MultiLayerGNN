@@ -1,0 +1,38 @@
+ninja_required_version = 1.3
+cxx = /home/clint/miniforge3/envs/pyt/bin/x86_64-conda-linux-gnu-c++
+nvcc = /usr/local/cuda/bin/nvcc
+
+cflags = -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/clint/miniforge3/envs/pyt/include -DNDEBUG -D_FORTIFY_SOURCE=2 -O2 -isystem /home/clint/miniforge3/envs/pyt/include -fPIC -I/tmp/pip-build-env-mnupn6lo/overlay/lib/python3.13/site-packages/torch/include -I/tmp/pip-build-env-mnupn6lo/overlay/lib/python3.13/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/home/clint/miniforge3/envs/pyt/include/python3.13 -c
+post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_cuda_radius_graph -std=c++17
+cuda_cflags = -I/tmp/pip-build-env-mnupn6lo/overlay/lib/python3.13/site-packages/torch/include -I/tmp/pip-build-env-mnupn6lo/overlay/lib/python3.13/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/home/clint/miniforge3/envs/pyt/include/python3.13 -c
+cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_cuda_radius_graph -gencode=arch=compute_120,code=compute_120 -gencode=arch=compute_120,code=sm_120 -ccbin /home/clint/miniforge3/envs/pyt/bin/x86_64-conda-linux-gnu-cc -std=c++17
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = 
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule cuda_compile
+  depfile = $out.d
+  deps = gcc
+  command = $nvcc -MD -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+
+
+
+
+
+
+build /home/clint/MultiLayerGNN/build/temp.linux-x86_64-cpython-313/morphology_gnn/cuda_radius_graph/radius_graph.o: compile /home/clint/MultiLayerGNN/morphology_gnn/cuda_radius_graph/radius_graph.cpp
+build /home/clint/MultiLayerGNN/build/temp.linux-x86_64-cpython-313/morphology_gnn/cuda_radius_graph/radius_graph_kernel.o: cuda_compile /home/clint/MultiLayerGNN/morphology_gnn/cuda_radius_graph/radius_graph_kernel.cu
+
+
+
+
+
+
+
+
