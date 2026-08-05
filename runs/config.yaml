@@ -1,0 +1,64 @@
+# Training run configuration.
+#
+# Precedence (lowest to highest):
+#   built-in defaults < this file < CLI flags (--lr 1e-4) < deep overrides
+#
+# Deep overrides use the dotted config path, e.g.:
+#   --model.atom_emb_kwargs.padding_idx 0
+#   --model.rbf_kwargs.cutoff_upper 6.0
+#   --training.optimizer_kwargs.betas "[0.9, 0.999]"
+#   --training.scheduler_class ReduceLROnPlateau
+
+# One or more HDF5 files (same layout, same target key).
+data:
+  - data/2-TNATA_ams.hdf5
+
+# Target property key within each HDF5 group.
+target: "Positive VIP"
+
+# Radius-graph cutoff (Angstrom).
+radius: 6.0
+
+model:
+  hidden_dim: 128
+  num_layers: 2
+  # Attention heads (only used when conv_class is GATConv).
+  heads: 8
+  num_rbf: 50
+  use_edge_features: false
+  conv_class: GATConv
+  # Extra kwargs for every conv layer (e.g. GATConv: {"concat": False}).
+  conv_kwargs: {}
+  # Deep kwargs passed to AtomTypeEmbedding (e.g. padding_idx).
+  atom_emb_kwargs: {}
+  # Deep kwargs passed to DistanceEmbedding (e.g. cutoff_upper, rbf_class).
+  rbf_kwargs: {}
+  # Optional: activation name ("gelu", "mish", "relu", "silu", "tanh").
+  # act: gelu
+  # Optional: global aggregation ("MeanAggregation", "SumAggregation", "MaxAggregation").
+  # global_aggr: MeanAggregation
+
+training:
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.0
+  max_epochs: 300
+  patience: 30
+  val_frac: 0.1
+  test_frac: 0.1
+  seed: 0
+  num_workers: 4
+  accelerator: auto
+  # Optimizer / scheduler names from the runner registries.
+  optimizer_class: Adam
+  optimizer_kwargs: {}
+  scheduler_class: null          # e.g. ReduceLROnPlateau, StepLR, CosineAnnealingLR, OneCycleLR
+  scheduler_kwargs: {}
+  scheduler_monitor: val_loss
+  scheduler_interval: epoch      # "epoch" or "step" (use "step" for OneCycleLR)
+  # Optional extra regression metrics to log: {name: loss_name}.
+  # extra_metrics: {mae: l1_loss, rmse: mse_loss}
+
+logging:
+  outdir: runs/artifacts
+  wandb_project: null            # set to a project name to enable W&B
