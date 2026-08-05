@@ -40,12 +40,60 @@ recommended: it supports comments and nested structures).
 Common flat flags: `--data <files...> --target --radius --hidden_dim --num_layers
 --heads --num_rbf --use_edge_features --conv_class --batch_size --lr --max_epochs
 --patience --val_frac --test_frac --seed --num_workers --accelerator --outdir
---wandb_project`.
+--wandb_project --run_name --group --tags --notes`.
 
 Use `--wandb-project <name>` (or `logging.wandb_project`) to log to Weights &
 Biases (requires `WANDB_API_KEY` in the environment). Without it, a `CSVLogger`
 is used and artifacts (checkpoints, `truth_vs_pred.png`, csv logs) land in
 `logging.outdir` (`runs/artifacts/` by default).
+
+### W&B run naming + clean finish
+
+When `logging.wandb_project` is set, each run gets a human-friendly name
+auto-generated from its hyperparameters, e.g.
+`GATConv-h128-l2-r6-bs32-lr0.0001-heads8-rbf50-20260805-120000` (see
+`_make_run_name` in `run_training.py`). Override with `--run_name` (or
+`logging.run_name`); `--group`, `--tags`, `--notes` are passed through to the
+`WandbLogger`.
+
+The run is **explicitly finished** via `wandb.finish()` in a `finally` block
+(`_finalize_wandb`). Lightning's `WandbLogger.finalize` does *not* call
+`wandb.finish()`, so without this a run that simply exits can be flagged as
+`crashed` by W&B even though training succeeded. Errors are logged onto the run
+before it is closed, and the truth-vs-predicted figure + final split MAE/RMSE
+are pushed to W&B before finishing.
+
+## Hyperparameter optimization: `runs/optimize.py`
+
+Optuna-driven HPO built on the same config + `run_training.py` blocks. Every
+**trial** samples a config (based on the base config file), trains for a capped
+number of epochs with early stopping + optional pruning, and returns a
+validation objective to minimize (default `val_mae`). The best config is written
+as YAML ready for `run_training.py --config`.
+
+```bash
+# Must use the torch conda environment
+conda run -n torch python runs/optimize.py \
+    --config runs/config.yaml --n-trials 20 --objective val_mae
+
+# Custom search space (see runs/search_space.yaml for the format)
+conda run -n torch python runs/optimize.py --config runs/config.yaml \
+    --search-space runs/search_space.yaml --n-trials 30
+
+# Resume a study + log trials/summary to W&B
+conda run -n torch python runs/optimize.py --config runs/config.yaml \
+    --study-name hpo-20260805 --resume --wandb-project InitialGNNtrial
+```
+
+Artifacts (sqlite study DB, `best_config.yaml`) land in
+`<logging.outdir>/hpo/`. Key flags: `--n-trials --timeout --max-epochs
+--patience --objective (val_mae|val_loss) --direction (minimize|maximize)
+--search-space --study-name --resume --storage --wandb-project
+--log-trials-csv --no-prune --no-progress-bar --seed`.
+
+Note: GCNConv/SAGEConv trials automatically drop `use_edge_features` (those
+convs have no `edge_dim` argument), so no trial crashes.
+
 
 ## Config file: `runs/config.yaml`
 

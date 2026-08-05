@@ -120,7 +120,17 @@ DEFAULT_CONFIG = {
         "scheduler_monitor": "val_loss",
         "scheduler_interval": "epoch",
     },
-    "logging": {"outdir": "runs/artifacts", "wandb_project": None},
+    "logging": {
+        "outdir": "runs/artifacts",
+        "wandb_project": None,
+        # Optional W&B niceties. `run_name` is auto-generated from the
+        # hyperparameters when left None; group/tags/notes are passed straight
+        # to the WandbLogger.
+        "run_name": None,
+        "group": None,
+        "tags": None,
+        "notes": None,
+    },
 }
 
 # Ergonomic CLI flags mapping to dotted config paths. Each defaults to None, so a
@@ -150,6 +160,10 @@ FLAG_DEFS = [
     ("accelerator", "training.accelerator", {}),
     ("outdir", "logging.outdir", {}),
     ("wandb_project", "logging.wandb_project", {}),
+    ("run_name", "logging.run_name", {}),
+    ("group", "logging.group", {}),
+    ("tags", "logging.tags", {}),
+    ("notes", "logging.notes", {}),
 ]
 
 
@@ -237,7 +251,11 @@ def parse_cli(argv=None):
     for flag, _path, kwargs in FLAG_DEFS:
         add_kwargs = dict(kwargs)
         add_kwargs.setdefault("default", None)
-        parser.add_argument(f"--{flag}", **add_kwargs)
+        # Register both spellings so `--max_epochs` and `--max-epochs` work.
+        option_strings = [f"--{flag}", f"--{flag.replace('_', '-')}"]
+        if option_strings[1] == option_strings[0]:
+            option_strings = option_strings[:1]
+        parser.add_argument(*option_strings, **add_kwargs)
 
     known = {flag for flag, _, _ in FLAG_DEFS} | {"config", "help"}
     dotted, kept = _extract_dotted_overrides(argv, known)
@@ -248,12 +266,14 @@ def parse_cli(argv=None):
 def _extract_dotted_overrides(argv, known_flags):
     """Pull out ``--a.b.c value``-style overrides so argparse never sees them."""
     overrides, kept = {}, []
+    # Normalize so hyphen/underscore flag spellings are both recognized.
+    known = {name.replace("-", "_") for name in known_flags}
     i = 0
     while i < len(argv):
         tok = argv[i]
         if tok.startswith("--") and len(tok) > 2:
             name = tok[2:].split("=", 1)[0]
-            if name not in known_flags:
+            if name.replace("-", "_") not in known:
                 if "=" in tok:
                     key, raw = tok[2:].split("=", 1)
                     overrides[key] = coerce(raw)
@@ -402,13 +422,76 @@ def _ensure_wandb_auth() -> None:
         ) from exc
 
 
-def build_logger(logging_cfg: dict):
+def _make_run_name(config: dict) -> str:
+    """Human-friendly, unique W&B run name derived from the resolved config.
+
+    Example: ``GATConv-h128-l2-r6-bs32-lr0.0001-heads8-rbf50-20260805-120000``.
+    Set ``logging.run_name`` (or ``--run_name``) to override.
+    """
+    from datetime import datetime
+
+    model = config.get("model", {})
+    training = config.get("training", {})
+    conv = str(model.get("conv_class", "GATConv")).rsplit(".", 1)[-1]
+    parts = [
+        conv,
+        f"h{model.get('hidden_dim', 128)}",
+        f"l{model.get('num_layers', 2)}",
+        f"r{config.get('radius', 6.0):g}",
+        f"bs{training.get('batch_size', 32)}",
+        f"lr{training.get('lr', 1e-4):g}",
+    ]
+    if model.get("heads"):
+        parts.append(f"heads{model['heads']}")
+    if model.get("num_rbf"):
+        parts.append(f"rbf{model['num_rbf']}")
+    if model.get("use_edge_features"):
+        parts.append("edgefeat")
+    if training.get("scheduler_class"):
+        parts.append(str(training["scheduler_class"]).rsplit(".", 1)[-1])
+    parts.append(datetime.now().strftime("%Y%m%d-%H%M%S"))
+    return "-".join(parts)
+
+
+def _finalize_wandb(logger) -> None:
+    """Explicitly mark the W&B run finished so it is never flagged as crashed.
+
+    ``WandbLogger.finalize`` only uploads checkpoints; it does **not** call
+    ``wandb.finish()`` (verified in Lightning 2.6.5), so a run whose process
+    simply exits can be recorded by W&B as ``crashed``. This helper calls
+    ``wandb.finish()`` and is a safe no-op for CSV / None loggers.
+    """
+    if logger is None:
+        return
+    try:
+        from lightning.pytorch.loggers import WandbLogger
+    except Exception:
+        return
+    if not isinstance(logger, WandbLogger):
+        return
+    try:
+        import wandb
+
+        if wandb.run is not None:
+            wandb.finish()
+    except Exception:
+        pass
+
+
+def build_logger(config: dict):
+    logging_cfg = config["logging"]
     wandb_project = logging_cfg.get("wandb_project")
     if wandb_project:
         from lightning.pytorch.loggers import WandbLogger
 
         _ensure_wandb_auth()
-        return WandbLogger(project=wandb_project)
+        return WandbLogger(
+            project=wandb_project,
+            name=logging_cfg.get("run_name") or _make_run_name(config),
+            group=logging_cfg.get("group"),
+            tags=logging_cfg.get("tags"),
+            notes=logging_cfg.get("notes"),
+        )
     return CSVLogger(save_dir=logging_cfg.get("outdir", "runs/artifacts"), name="csv")
 
 
@@ -492,69 +575,93 @@ def main() -> None:
     outdir = config["logging"]["outdir"]
     os.makedirs(outdir, exist_ok=True)
 
-    # 1. Dataset (one or several HDF5 files) and train/val/test split.
-    data_files = config["data"]
-    if isinstance(data_files, str):
-        data_files = [data_files]
-    dataset = CombinedH5MolecularDataset(
-        data_files, config["target"], radius=config["radius"]
-    )
-    total_loader, train_loader, val_loader, test_loader = build_loaders(
-        dataset, config["training"]
-    )
+    logger = None
+    try:
+        # 1. Dataset (one or several HDF5 files) and train/val/test split.
+        data_files = config["data"]
+        if isinstance(data_files, str):
+            data_files = [data_files]
+        dataset = CombinedH5MolecularDataset(
+            data_files, config["target"], radius=config["radius"]
+        )
+        total_loader, train_loader, val_loader, test_loader = build_loaders(
+            dataset, config["training"]
+        )
 
-    # 2. Model + Lightning wrapper.
-    model = build_model(config["model"])
-    system = build_module(model, config["training"])
+        # 2. Model + Lightning wrapper.
+        model = build_model(config["model"])
+        system = build_module(model, config["training"])
 
-    # 3. Logger + callbacks.
-    logger = build_logger(config["logging"])
-    callbacks = [
-        EarlyStopping(
-            monitor="val_loss",
-            mode="min",
-            patience=config["training"]["patience"],
-        ),
-        ModelCheckpoint(
-            monitor="val_loss",
-            mode="min",
-            save_top_k=1,
-            dirpath=os.path.join(outdir, "checkpoints"),
-            filename="best-{epoch}-{val_loss:.4f}",
-        ),
-    ]
-    trainer = pl.Trainer(
-        max_epochs=config["training"]["max_epochs"],
-        accelerator=config["training"]["accelerator"],
-        devices=1,
-        log_every_n_steps=10,
-        callbacks=callbacks,
-        logger=logger,
-    )
-    trainer.fit(system, train_loader, val_loader)
+        # 3. Logger + callbacks.
+        logger = build_logger(config)
+        callbacks = [
+            EarlyStopping(
+                monitor="val_loss",
+                mode="min",
+                patience=config["training"]["patience"],
+            ),
+            ModelCheckpoint(
+                monitor="val_loss",
+                mode="min",
+                save_top_k=1,
+                dirpath=os.path.join(outdir, "checkpoints"),
+                filename="best-{epoch}-{val_loss:.4f}",
+            ),
+        ]
+        trainer = pl.Trainer(
+            max_epochs=config["training"]["max_epochs"],
+            accelerator=config["training"]["accelerator"],
+            devices=1,
+            log_every_n_steps=10,
+            callbacks=callbacks,
+            logger=logger,
+        )
+        trainer.fit(system, train_loader, val_loader)
 
-    # 4. Final truth-vs-predicted figure for total / train / validation / test.
-    predictions = []
-    for name, loader in [
-        ("Total", total_loader),
-        ("Train", train_loader),
-        ("Validation", val_loader),
-        ("Test", test_loader),
-    ]:
-        truth, pred = predict(system, loader)
-        mae = (truth - pred).abs().mean().item()
-        rmse = ((truth - pred) ** 2).mean().sqrt().item()
-        print(f"{name:>10}: MAE={mae:.4f}  RMSE={rmse:.4f}  n={len(truth)}")
-        predictions.append((name, truth, pred))
+        # 4. Final truth-vs-predicted figure for total / train / validation / test.
+        predictions, final_metrics = [], {}
+        for name, loader in [
+            ("Total", total_loader),
+            ("Train", train_loader),
+            ("Validation", val_loader),
+            ("Test", test_loader),
+        ]:
+            truth, pred = predict(system, loader)
+            mae = (truth - pred).abs().mean().item()
+            rmse = ((truth - pred) ** 2).mean().sqrt().item()
+            print(f"{name:>10}: MAE={mae:.4f}  RMSE={rmse:.4f}  n={len(truth)}")
+            predictions.append((name, truth, pred))
+            final_metrics[f"{name.lower()}_mae"] = mae
+            final_metrics[f"{name.lower()}_rmse"] = rmse
 
-    plot_path = os.path.join(outdir, "truth_vs_pred.png")
-    save_truth_vs_pred_figure(predictions, plot_path)
-    print(f"Saved truth-vs-predicted plot to {plot_path}")
+        plot_path = os.path.join(outdir, "truth_vs_pred.png")
+        save_truth_vs_pred_figure(predictions, plot_path)
+        print(f"Saved truth-vs-predicted plot to {plot_path}")
 
-    if config["logging"].get("wandb_project"):
-        import wandb
+        # 5. Push the figure + final split metrics to W&B *before* finishing,
+        #    so the run is recorded as "finished" (not "crashed") with all
+        #    artifacts attached.
+        if config["logging"].get("wandb_project"):
+            import wandb
 
-        wandb.log({"truth_vs_pred": wandb.Image(plot_path)})
+            wandb.log({"truth_vs_pred": wandb.Image(plot_path)})
+            wandb.log(final_metrics)
+    except BaseException:
+        # Record the failure on the run, then re-raise (the finally block still
+        # marks the run finished rather than crashed).
+        if config["logging"].get("wandb_project"):
+            try:
+                import traceback
+                import wandb
+
+                if wandb.run is not None:
+                    wandb.log({"error": traceback.format_exc()})
+            except Exception:
+                pass
+        raise
+    finally:
+        # Explicitly close the W&B run (Lightning's WandbLogger does not).
+        _finalize_wandb(logger)
 
 
 if __name__ == "__main__":

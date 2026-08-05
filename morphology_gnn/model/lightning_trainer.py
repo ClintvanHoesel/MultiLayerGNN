@@ -80,7 +80,7 @@ class SimpleLightningMoleculeModule(pl.LightningModule):
         )
 
     def _shared_step(self, batch: Any, prefix: str) -> torch.Tensor:
-        y_hat = self(batch)
+        y_hat = self(batch).view_as(batch.y)  # (B, 1) -> (B,), matching y
         y = batch.y
         loss = self.loss_func(y_hat, y)
         # Log the loss plus every configured extra metric (l1, rmse, ...) as

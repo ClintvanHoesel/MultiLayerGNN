@@ -1,0 +1,65 @@
+# Example Optuna search space for `runs/optimize.py`.
+#
+# Pass with:  conda run -n torch python runs/optimize.py --search-space runs/search_space.yaml
+#
+# Every key is a dotted config path (same syntax as run_training.py deep
+# overrides). Supported sampling types:
+#   categorical: {type: categorical, choices: [...]}
+#   int:         {type: int, low: ..., high: ..., step: ...}
+#   float:       {type: float, low: ..., high: ..., step: ...}
+#   log_float:   {type: log_float, low: ..., high: ...}
+#   log_int:     {type: log_int, low: ..., high: ...}
+#
+# Omit a key to keep that option fixed at its value from the base config.
+
+model.hidden_dim:
+  type: categorical
+  choices: [64, 128, 256]
+
+model.num_layers:
+  type: int
+  low: 1
+  high: 4
+
+model.heads:
+  type: categorical
+  choices: [1, 2, 4, 8]
+
+model.num_rbf:
+  type: categorical
+  choices: [25, 50, 75, 100]
+
+model.dropout:
+  type: float
+  low: 0.0
+  high: 0.5
+
+model.act:
+  type: categorical
+  choices: ["gelu", "mish", "relu", "silu"]
+
+model.conv_class:
+  type: categorical
+  choices: ["GATConv", "GCNConv", "SAGEConv"]
+
+model.use_edge_features:
+  type: categorical
+  choices: [false, true]
+
+training.lr:
+  type: log_float
+  low: 0.00001
+  high: 0.01
+
+training.batch_size:
+  type: categorical
+  choices: [16, 32, 64]
+
+training.weight_decay:
+  type: log_float
+  low: 0.000001
+  high: 0.01
+
+training.optimizer_class:
+  type: categorical
+  choices: ["Adam", "AdamW"]

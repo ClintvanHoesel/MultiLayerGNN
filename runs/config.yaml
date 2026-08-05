@@ -61,4 +61,12 @@ training:
 
 logging:
   outdir: runs/artifacts
-  wandb_project: null            # set to a project name to enable W&B
+  # Set to a W&B project name to enable W&B logging. When enabled, the run gets
+  # a human-friendly auto-generated name from the hyperparameters (see
+  # run_training._make_run_name); override it with `run_name` below.
+  wandb_project: null
+  # Optional W&B niceties:
+  run_name: null             # e.g. "gat-h256-l4-r6.0" (auto if null)
+  group: null                # group related runs together in the W&B UI
+  tags: null                 # e.g. [baseline, gat]  (list)
+  notes: null                # free-text description shown on the run page
