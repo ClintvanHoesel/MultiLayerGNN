@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import sys
+from typing import Protocol, Sequence, cast
 
 import lightning.pytorch as pl
 import matplotlib
@@ -42,6 +43,7 @@ import torch.nn.functional as F
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks.model_checkpoint import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
+from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GATConv, GCNConv, SAGEConv
 
@@ -751,7 +753,7 @@ def build_callbacks(config: dict, ckpt_dir: str, name_prefix: str = "") -> list:
 
 
 # --- data ---------------------------------------------------------------------
-def build_loaders(dataset, train_cfg: dict):
+def build_loaders(dataset: Dataset, train_cfg: dict):
     n = len(dataset)
     test_size = int(train_cfg["test_frac"] * n)
     val_size = int(train_cfg["val_frac"] * n)
@@ -766,27 +768,41 @@ def build_loaders(dataset, train_cfg: dict):
 
     bs, nw = train_cfg["batch_size"], train_cfg["num_workers"]
     total_loader = DataLoader(dataset, batch_size=bs, num_workers=0)
-    train_loader = DataLoader(train_set, batch_size=bs, shuffle=True, num_workers=nw)
-    val_loader = DataLoader(val_set, batch_size=bs, num_workers=nw)
-    test_loader = DataLoader(test_set, batch_size=bs, num_workers=nw)
+    # PyG's DataLoader type only accepts Dataset/Sequence[BaseData]/DatasetAdapter,
+    # so the torch.utils.data.Subset returned by random_split is cast (runtime no-op).
+    train_loader = DataLoader(
+        cast(Dataset, train_set), batch_size=bs, shuffle=True, num_workers=nw
+    )
+    val_loader = DataLoader(cast(Dataset, val_set), batch_size=bs, num_workers=nw)
+    test_loader = DataLoader(cast(Dataset, test_set), batch_size=bs, num_workers=nw)
     return total_loader, train_loader, val_loader, test_loader
 
 
-def build_loaders_from_indices(dataset, train_idx, val_idx, train_cfg: dict):
+def build_loaders_from_indices(
+    dataset: Dataset, train_idx, val_idx, train_cfg: dict
+):
     """Build train/val loaders from explicit index arrays (cross-validation)."""
     bs, nw = train_cfg["batch_size"], train_cfg["num_workers"]
     train_loader = DataLoader(
-        torch.utils.data.Subset(dataset, list(train_idx)),
+        cast(Dataset, torch.utils.data.Subset(dataset, list(train_idx))),
         batch_size=bs,
         shuffle=True,
         num_workers=nw,
     )
     val_loader = DataLoader(
-        torch.utils.data.Subset(dataset, list(val_idx)),
+        cast(Dataset, torch.utils.data.Subset(dataset, list(val_idx))),
         batch_size=bs,
         num_workers=nw,
     )
     return train_loader, val_loader
+
+
+class _HasTargetMeanStd(Protocol):
+    """Structural type for datasets exposing a fitted ``target_mean_std``."""
+
+    def target_mean_std(
+        self, indices: Sequence[int] | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def fit_target_scaler(loader, num_targets: int):
@@ -802,7 +818,7 @@ def fit_target_scaler(loader, num_targets: int):
         indices = base.indices
         base = base.dataset
     if hasattr(base, "target_mean_std"):
-        mean, std = base.target_mean_std(indices)
+        mean, std = cast(_HasTargetMeanStd, base).target_mean_std(indices)
         return mean.view(-1), std.view(-1)
     ys = []
     for batch in loader:
@@ -1105,7 +1121,7 @@ def _run_cross_validation(config, targets, dataset, outdir) -> None:
                     )
             keys = list(fold_metrics[0][1].keys())
             table = wandb.Table(
-                columns=["fold"] + keys,
+                columns=cast("list[str | int]", ["fold"] + keys),
                 data=[[label] + [m[k] for k in keys] for label, m in fold_metrics],
             )
             wandb.log({"cv/fold_metrics": table})

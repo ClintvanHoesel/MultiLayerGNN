@@ -380,11 +380,11 @@ def build_logger(config: dict, run_name_suffix: str = "", run_name: str | None =
 # --- generation evaluation + artifacts ---------------------------------------
 def write_xyz(path: str, atom_types: torch.Tensor, pos: torch.Tensor) -> None:
     """Write a simple XYZ file for visualization."""
-    atom_types = atom_types.cpu().numpy()
-    pos = pos.cpu().numpy()
+    types_np = atom_types.cpu().numpy()
+    pos_np = pos.cpu().numpy()
     with open(path, "w") as f:
-        f.write(f"{len(atom_types)}\nGenerated\n")
-        for z, p in zip(atom_types, pos):
+        f.write(f"{len(types_np)}\nGenerated\n")
+        for z, p in zip(types_np, pos_np):
             f.write(f"{int(z):3d} {p[0]:10.4f} {p[1]:10.4f} {p[2]:10.4f}\n")
 
 

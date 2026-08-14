@@ -281,7 +281,7 @@ def _make_objective(base_config, search_space, args, study_name):
             config=trial_config,
         )
 
-        callbacks = [
+        callbacks: list[pl.Callback] = [
             EarlyStopping(
                 monitor=args.objective,
                 mode=direction_mode,
