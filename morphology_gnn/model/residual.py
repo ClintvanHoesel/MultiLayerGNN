@@ -6,6 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 from typing import Callable
 import torch_geometric
+import torch_geometric.nn
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +69,15 @@ class Residual(nn.Module):
         dropout: float = 0.0,
         pre_norm: bool = False,
         post_norm: bool = False,
-        norm: type[nn.Module] | nn.Module | None = None,
+        norm: nn.Module | None = None,
         hidden_dim: int | None = None,
     ) -> None:
         super().__init__()
-        self.sublayer = sublayer
+        # Explicit annotations keep the type checker from inferring these
+        # wrapped modules as ``torch.Tensor`` (which would otherwise report
+        # "Object of type 'Tensor' is not callable" at the call sites).
+        self.sublayer: nn.Module = sublayer
+        self.norm: nn.Module
         if norm is None or norm is nn.Identity:
             self.norm = nn.Identity()
         elif isinstance(norm, nn.Module):
@@ -183,7 +188,7 @@ class HistoryAttention(nn.Module):
         self.w_q = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.w_k = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.w_v = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        if isinstance(dropout, float):
+        if isinstance(dropout, (float, int)):
             self.dropout = nn.Dropout(dropout)
         else:
             self.dropout = dropout

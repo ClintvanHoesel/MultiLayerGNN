@@ -3,7 +3,7 @@ import logging
 
 import torch
 
-from .rbf import GaussianRBF
+from .rbf import AbstractRBF, GaussianRBF
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ class DistanceEmbedding(torch.nn.Module):
     def __init__(
         self,
         num_rbf: int = 50,
-        rbf_class=GaussianRBF,
+        rbf_class: type[AbstractRBF] | AbstractRBF = GaussianRBF,
         cutoff_lower: float = 0.0,
         cutoff_upper: float = 5.0,
         trainable: bool = True,
