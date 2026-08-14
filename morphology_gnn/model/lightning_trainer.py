@@ -5,12 +5,49 @@ accepts the ``(x, edge_index, batch)`` triple from a PyG ``Batch`` and returns a
 prediction of shape ``(num_graphs, 1)`` matching ``batch.y``.
 """
 
+import json
+import logging
 from collections.abc import Callable
 from typing import Any
 
 import lightning.pytorch as pl
 import torch
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
+
+
+def r2_score(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Coefficient of determination (R²) between predictions and targets.
+
+    ``R² = 1 - SS_res / SS_tot``. This is the per-call (e.g. per-batch) value;
+    during training Lightning averages it over batches, so the authoritative
+    number is the one computed over the full dataset (see ``run_training.main``).
+
+    Follows the scikit-learn convention for degenerate (constant) targets:
+    returns 1.0 when the predictions are exact and 0.0 otherwise, avoiding NaN.
+    """
+    y_hat = y_hat.reshape_as(y)
+    ss_res = ((y - y_hat) ** 2).sum()
+    ss_tot = ((y - y.mean()) ** 2).sum()
+    if ss_tot.item() == 0:
+        return torch.tensor(
+            1.0 if ss_res.item() == 0 else 0.0, device=y.device, dtype=y.dtype
+        )
+    return 1.0 - ss_res / ss_tot
+
+
+def _json_safe(value: Any) -> Any:
+    """Best-effort JSON round-trip so config hparams are W&B/checkpoint-safe.
+
+    The resolved config may contain values (e.g. numpy scalars, tuples) that
+    ``wandb.config`` / Lightning hparams dislike; ``default=str`` guarantees a
+    serializable copy. Falls back to ``None`` on failure.
+    """
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except Exception:
+        return None
 
 
 class SimpleLightningMoleculeModule(pl.LightningModule):
@@ -23,11 +60,17 @@ class SimpleLightningMoleculeModule(pl.LightningModule):
     ``torch.optim.lr_scheduler``, e.g. ``ReduceLROnPlateau``, ``StepLR``,
     ``CosineAnnealingLR``, ``OneCycleLR``). Any number of extra regression
     metrics can be logged alongside the loss via ``extra_metrics`` — a
-    ``{name: callable}`` map, e.g. ``{"mae": F.l1_loss, "rmse": rmse}`` — each
-    logged as ``{split}_{name}``. All knobs are persisted in ``self.hparams`` —
+    ``{name: callable}`` map, e.g. ``{"mae": F.l1_loss, "r2": r2_score}`` — each
+    logged as ``{split}_{name}``. If ``target_tags`` (one W&B-friendly label per
+    target property, e.g. ``["positive_vip", "homo"]``) is provided, the loss
+    and every extra metric are also computed per target and logged as
+    ``{split}_target_{tag}_{name}``. All knobs are persisted in ``self.hparams`` —
     except ``model``, ``loss_func`` and ``extra_metrics``, which are not
     trivially reconstructible from a checkpoint and must be passed again to
-    ``load_from_checkpoint``.
+    ``load_from_checkpoint``. The full resolved run config can be passed via
+    ``config``; it is stored in ``self.hparams["config"]`` so it persists in the
+    checkpoint and is auto-logged to W&B (Overview -> Config) by the
+    ``WandbLogger`` at fit time.
     """
 
     def __init__(
@@ -45,6 +88,10 @@ class SimpleLightningMoleculeModule(pl.LightningModule):
         extra_metrics: (
             dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] | None
         ) = None,
+        target_tags: list[str] | None = None,
+        target_mean: torch.Tensor | list | None = None,
+        target_std: torch.Tensor | list | None = None,
+        config: dict | None = None,
     ) -> None:
         super().__init__()
         self.model = model
@@ -59,9 +106,49 @@ class SimpleLightningMoleculeModule(pl.LightningModule):
         self.scheduler_interval = scheduler_interval
         # Default to MAE (keeps the previous behaviour); pass {} to log only loss.
         self.extra_metrics = (
-            extra_metrics if extra_metrics is not None else {"mae": F.l1_loss}
+            extra_metrics
+            if extra_metrics is not None
+            else {"mae": F.l1_loss, "r2": r2_score}
         )
-        self.save_hyperparameters(ignore=["model", "loss_func", "extra_metrics"])
+        # One W&B-friendly label per target property (e.g. ["positive_vip"]).
+        # When set, the loss and every extra metric are also logged per target.
+        self.target_tags = list(target_tags) if target_tags is not None else None
+        # Target standardization: per-target mean/std (fit on the training set).
+        # The loss is computed on standardized targets (well-conditioned for
+        # near-constant / large-magnitude targets) and predictions are
+        # un-standardized via :meth:`denormalize_targets`. Defaults to identity.
+        num_targets = getattr(getattr(model, "lin", None), "out_features", 1)
+        self.register_buffer(
+            "target_mean",
+            (
+                torch.zeros(num_targets)
+                if target_mean is None
+                else torch.as_tensor(target_mean, dtype=torch.float32)
+            ),
+        )
+        self.register_buffer(
+            "target_std",
+            (
+                torch.ones(num_targets)
+                if target_std is None
+                else torch.as_tensor(target_std, dtype=torch.float32)
+            ),
+        )
+        # Full resolved config (data/model/training/logging sections). Kept in
+        # hparams so it (a) persists in the checkpoint, (b) is auto-logged to
+        # W&B by the WandbLogger at fit time (Overview -> Config), and (c) is
+        # available as self.hparams["config"]. JSON-normalized for safety.
+        config = _json_safe(config) if isinstance(config, dict) else None
+        self.config = config
+        self.save_hyperparameters(
+            ignore=[
+                "model",
+                "loss_func",
+                "extra_metrics",
+                "target_mean",
+                "target_std",
+            ]
+        )
 
     def forward(self, data: Any) -> torch.Tensor:
         """Predict graph-level properties from a batched PyG graph.
@@ -79,15 +166,57 @@ class SimpleLightningMoleculeModule(pl.LightningModule):
             data.x, data.edge_index, data.batch, getattr(data, "pos", None)
         )
 
+    def normalize_targets(self, y: torch.Tensor) -> torch.Tensor:
+        """Standardize targets to zero-mean / unit-variance per target column.
+
+        Accepts the flattened ``y`` (``(B*T,)`` / ``(B,)`` as produced by PyG
+        batching) and returns it flattened and standardized.
+        """
+        y = y.reshape(-1, self.target_mean.numel())
+        return ((y - self.target_mean) / self.target_std).reshape(-1)
+
+    def denormalize_targets(self, y_hat: torch.Tensor) -> torch.Tensor:
+        """Map standardized predictions back to the original target scale.
+
+        Args:
+            y_hat: Model output of shape ``(num_graphs, num_targets)``.
+
+        Returns:
+            Predictions of shape ``(num_graphs, num_targets)`` in original units.
+        """
+        return (
+            y_hat.reshape(-1, self.target_mean.numel()) * self.target_std
+            + self.target_mean
+        )
+
     def _shared_step(self, batch: Any, prefix: str) -> torch.Tensor:
-        y_hat = self(batch).view_as(batch.y)  # (B, 1) -> (B,), matching y
-        y = batch.y
-        loss = self.loss_func(y_hat, y)
-        # Log the loss plus every configured extra metric (l1, rmse, ...) as
-        # {prefix}_{name}. Any number of metrics can be added via extra_metrics.
+        y_hat = self(batch)  # (num_graphs, num_targets), in standardized space
+        y = batch.y  # (num_graphs,) or (num_graphs*num_targets,) after PyG flattening
+        # Align shapes for the aggregate loss: PyG flattens a per-graph `y` of
+        # shape (T,) into (B*T,) when batching, so reshape the model output to
+        # match whatever `y` looks like.
+        y_hat_flat = y_hat.view_as(y)
+        # The loss is computed on standardized targets (well-conditioned for
+        # near-constant / large-magnitude targets); predictions and the extra
+        # metrics are reported in the original (physical) target units.
+        y_norm = self.normalize_targets(y)
+        loss = self.loss_func(y_hat_flat, y_norm)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[%s] batch graphs=%d loss=%.6f",
+                prefix,
+                batch.num_graphs,
+                float(loss),
+            )
+        # Aggregate metrics: loss plus every configured extra metric (l1, rmse,
+        # ...) as {prefix}_{name}, computed on denormalized predictions so the
+        # logged values are in physical target units.
+        n_targets = self.target_mean.numel()
+        y_hat_raw = self.denormalize_targets(y_hat)  # (B, T) original units
+        y_raw = y.reshape(-1, n_targets)  # (B, T) original units
         metrics = {f"{prefix}_loss": loss}
         for name, metric_fn in (self.extra_metrics or {}).items():
-            metrics[f"{prefix}_{name}"] = metric_fn(y_hat, y)
+            metrics[f"{prefix}_{name}"] = metric_fn(y_hat_raw, y_raw)
         self.log_dict(
             metrics,
             on_step=prefix == "train",
@@ -96,6 +225,30 @@ class SimpleLightningMoleculeModule(pl.LightningModule):
             batch_size=batch.num_graphs,
             sync_dist=True,
         )
+
+        # Per-target metrics ({prefix}_target_{tag}_{name}): split both
+        # predictions and targets into one column per property. Handles the
+        # single-target case (target_tags of length 1, y of shape (B,)) and the
+        # flattened multi-target case (PyG packs y as (B*T,) -> (B, T)).
+        if self.target_tags:
+            y_norm_m = y_norm.reshape(-1, n_targets)  # standardized (B, T)
+            per_target = {}
+            for t, tag in enumerate(self.target_tags):
+                per_target[f"{prefix}_target_{tag}_loss"] = self.loss_func(
+                    y_hat[:, t], y_norm_m[:, t]
+                )
+                for name, metric_fn in (self.extra_metrics or {}).items():
+                    per_target[f"{prefix}_target_{tag}_{name}"] = metric_fn(
+                        y_hat_raw[:, t], y_raw[:, t]
+                    )
+            self.log_dict(
+                per_target,
+                on_step=prefix == "train",
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch.num_graphs,
+                sync_dist=True,
+            )
         return loss
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
@@ -107,10 +260,22 @@ class SimpleLightningMoleculeModule(pl.LightningModule):
     def test_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         return self._shared_step(batch, "test")
 
+    def on_train_epoch_end(self) -> None:
+        """Log the current learning rate once per epoch (W&B / CSV)."""
+        try:
+            opt = self.optimizers()
+            if isinstance(opt, (list, tuple)):
+                opt = opt[0]
+            lr = opt.param_groups[0]["lr"]
+        except Exception:
+            return
+        self.log("lr", lr, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+
     def predict_step(
         self, batch: Any, batch_idx: int, dataloader_idx: int = 0
     ) -> torch.Tensor:
-        return self(batch)
+        # Return predictions in the original target units.
+        return self.denormalize_targets(self(batch))
 
     def configure_optimizers(self):
         optimizer_kwargs = dict(self.optimizer_kwargs or {})
@@ -118,6 +283,11 @@ class SimpleLightningMoleculeModule(pl.LightningModule):
         optimizer_kwargs.setdefault("lr", self.lr)
         optimizer_kwargs.setdefault("weight_decay", self.weight_decay)
         optimizer = self.optimizer_class(self.parameters(), **optimizer_kwargs)
+        logger.debug(
+            "configure_optimizers: optimizer=%s scheduler=%s",
+            type(optimizer).__name__,
+            self.scheduler_class.__name__ if self.scheduler_class is not None else None,
+        )
 
         if self.scheduler_class is None:
             return optimizer

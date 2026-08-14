@@ -1,7 +1,11 @@
 import inspect
+import logging
+
 import torch
 
 from .rbf import GaussianRBF
+
+logger = logging.getLogger(__name__)
 
 # Largest atomic number in the standard periodic table (Oganesson, Z=118).
 MAX_ATOMIC_NUMBER = 118
@@ -222,5 +226,11 @@ class EdgeVectorLayer(torch.nn.Module):
         Returns:
             Edge attributes of shape ``(E, num_rbf)``.
         """
+        logger.debug(
+            "EdgeVectorLayer: %d edges, %d nodes, num_rbf=%d",
+            edge_index.shape[1],
+            pos.shape[0],
+            self.embedding_dim,
+        )
         displacement = pos[edge_index[1]] - pos[edge_index[0]]  # (E, 3)
         return self.edge_emb(displacement)

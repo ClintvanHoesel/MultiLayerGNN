@@ -1,0 +1,98 @@
+# Diffusion position-generator configuration.
+#
+# Trains an EGNN-style SE(3)-equivariant denoiser (epsilon-prediction DDPM) on
+# molecular positions: the model learns to denoise a molecule's atomic
+# coordinates inside its periodic cell, conditioned on atom types + cell. At the
+# end of training (or via the saved checkpoint) it can generate new conformations.
+#
+# Precedence (lowest to highest):
+#   built-in defaults < this file < CLI flags (--lr 1e-4) < deep overrides
+#
+# Deep overrides use the dotted config path, e.g.:
+#   --model.hidden_dim 256
+#   --diffusion.schedule linear
+#   --sampling.steps 50 --sampling.ddim true
+
+# One or more HDF5 files (same layout, same target key).
+data:
+  - data/2-TNATA_ams.hdf5
+
+# Target property key(s) within each HDF5 group. Required by the dataset loader,
+# but UNUSED by the diffusion model (no property conditioning).
+target: "Positive VIP"
+
+# Radius-graph cutoff (Angstrom) for the PBC neighbor list. REQUIRED — no
+# default: every run must set it manually (here, or with --radius).
+radius: 4.0
+
+model:
+  hidden_dim: 128
+  num_layers: 2
+  # Attention heads (only used when conv_class is GATConv).
+  heads: 4
+  num_rbf: 50
+  # The message-passing backbone must accept an `edge_dim` argument (GATConv,
+  # TransformerConv, ...); it consumes the RBF min-image edge features.
+  conv_class: GATConv
+  conv_kwargs: {}
+  # Deep kwargs passed to the RBF distance embedding (e.g. {rbf_class:
+  # ExpNormalSmearing}). cutoff_upper defaults to `radius` when omitted.
+  rbf_kwargs: {}
+  cutoff_lower: 0.0
+  cutoff_upper: null            # optional -> defaults to `radius`
+  # Whether to wrap each conv layer in a Residual connection.
+  use_residual: true
+  # Normalization type inside the residual wrapper (names from the residual
+  # NORM_REGISTRY): identity/layernorm/batchnorm/graphnorm/instancenorm.
+  norm: null
+  norm_kwargs: {}
+  # Width of the MLP that embeds the (3,) box lengths into node features.
+  cell_embed_dim: 16
+  # Whether the noise head includes an isotropic per-atom term (zero-initialized).
+  self_term: true
+
+diffusion:
+  # Noise schedule for the forward process: cosine (default) or linear.
+  schedule: cosine
+
+training:
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.0
+  max_epochs: 200
+  patience: 30
+  val_frac: 0.1
+  test_frac: 0.1
+  seed: 0
+  num_workers: 4
+  accelerator: auto
+  optimizer_class: Adam
+  optimizer_kwargs: {}
+  scheduler_class: null
+  scheduler_kwargs: {}
+  scheduler_monitor: val_loss
+  scheduler_interval: epoch
+
+sampling:
+  # Number of reverse-diffusion steps used when generating structures.
+  steps: 100
+  # Deterministic DDIM sampling instead of the stochastic DDPM update.
+  ddim: false
+  # DDIM stochasticity (only when ddim is true; 0 = fully deterministic).
+  eta: 0.0
+  # How many new conformations to generate per reference frame (end of run).
+  num_samples: 8
+  # How many reference frames per split to condition generation on.
+  num_reference: 4
+  seed: 0
+
+logging:
+  outdir: runs/artifacts_diffusion
+  wandb_project: null
+  run_name: null
+  group: null
+  tags: null
+  notes: null
+  # Stdlib logging: WARNING (silent) / INFO (default) / DEBUG (verbose).
+  level: INFO
+  log_file: null

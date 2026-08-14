@@ -1,4 +1,8 @@
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def wigner_D(l, alpha, beta, gamma):
@@ -33,6 +37,7 @@ def wigner_D(l, alpha, beta, gamma):
     `torch.Tensor`
         tensor :math:`D^l(\alpha, \beta, \gamma)` of shape :math:`(2l+1, 2l+1)`
     """
+    logger.debug("wigner_D(l=%d, shape=%s)", l, tuple(alpha.shape))
     alpha, beta, gamma = torch.broadcast_tensors(alpha, beta, gamma)
     alpha = alpha[..., None, None] % (2 * torch.pi)
     beta = beta[..., None, None] % (2 * torch.pi)

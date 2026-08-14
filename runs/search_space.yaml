@@ -14,12 +14,12 @@
 
 model.hidden_dim:
   type: categorical
-  choices: [64, 128, 256]
+  choices: [64, 128, 256, 512]
 
 model.num_layers:
   type: int
   low: 1
-  high: 4
+  high: 8
 
 model.heads:
   type: categorical
@@ -38,13 +38,13 @@ model.act:
   type: categorical
   choices: ["gelu", "mish", "relu", "silu"]
 
-model.conv_class:
-  type: categorical
-  choices: ["GATConv", "GCNConv", "SAGEConv"]
+# model.conv_class:
+#   type: categorical
+#   choices: ["GATConv", "GCNConv", "SAGEConv"]
 
-model.use_edge_features:
-  type: categorical
-  choices: [false, true]
+# model.use_edge_features:
+#   type: categorical
+#   choices: [false, true]
 
 training.lr:
   type: log_float
@@ -57,9 +57,23 @@ training.batch_size:
 
 training.weight_decay:
   type: log_float
-  low: 0.000001
-  high: 0.01
+  low: 0.0000001
+  high: 0.001
 
-training.optimizer_class:
-  type: categorical
-  choices: ["Adam", "AdamW"]
+# training.optimizer_class:
+#   type: categorical
+#   choices: ["Adam", "AdamW"]
+
+radius:
+  type: float
+  low: 0.
+  high: 6.
+
+# Optional normalization search space (uncomment to tune). `model.norm` is the
+# first-class knob (applied inside the residual wrapper).
+# model.norm:
+#   type: categorical
+#   choices: ["Identity", "LayerNorm", "BatchNorm", "GraphNorm", "InstanceNorm"]
+# model.use_residual:
+#   type: categorical
+#   choices: [true, false]

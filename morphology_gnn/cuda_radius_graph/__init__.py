@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
 import torch
 from torch.utils.cpp_extension import load
+
+logger = logging.getLogger(__name__)
 
 try:
     from . import _cuda_radius_graph as _extension
 
     _cuda_available = True
-except ImportError:
+    logger.debug("pre-imported CUDA radius graph extension")
+except ImportError as exc:
     _extension = None
     _cuda_available = False
+    logger.debug("pre-import of CUDA radius graph extension failed: %s", exc)
 
 _this_dir = Path(__file__).resolve().parent
 _build_dir = _this_dir / "_build"
@@ -34,9 +40,15 @@ def _load_extension() -> None:
             extra_cuda_cflags=["-O3"],
         )
         _cuda_available = True
+        logger.debug("CUDA radius graph extension loaded")
     except Exception as exc:
         _build_error = exc
         _cuda_available = False
+        logger.warning(
+            "CUDA radius graph extension failed to build/load (%s); "
+            "falling back to the Python implementation",
+            exc,
+        )
 
 
 _load_extension()

@@ -1,4 +1,8 @@
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 # https://github.com/atomicarchitects/equiformer_v3/blob/main/experimental/models/equiformer_v3/drop.py
@@ -13,6 +17,13 @@ class EquivariantDropout(torch.nn.Module):
         self.mmax = mmax
         self.drop_prob = drop_prob
         self.use_m_primary = use_m_primary
+        logger.debug(
+            "EquivariantDropout(lmax=%d, mmax=%d, drop_prob=%s, use_m_primary=%s)",
+            lmax,
+            mmax,
+            drop_prob,
+            use_m_primary,
+        )
 
         self.drop = torch.nn.Dropout(drop_prob, True)
 

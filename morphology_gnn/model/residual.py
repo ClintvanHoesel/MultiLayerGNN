@@ -1,11 +1,37 @@
+import inspect
+import logging
+
 import torch
 from torch import nn
 from torch.nn import functional as F
 from typing import Callable
+import torch_geometric
+
+logger = logging.getLogger(__name__)
+
+NORM_REGISTRY = {
+    "identity": nn.Identity,
+    "layernorm": torch_geometric.nn.norm.LayerNorm,
+    "batchnorm": torch_geometric.nn.norm.BatchNorm,
+    "graphnorm": torch_geometric.nn.norm.GraphNorm,
+    "instancenorm": torch_geometric.nn.norm.InstanceNorm,
+}
+
+
+def _resolve_sublayer_dim(sublayer: nn.Module) -> int | None:
+    """Best-effort feature dimension of a wrapped sublayer."""
+    for attr in ("hidden_dim", "out_channels", "in_channels"):
+        value = getattr(sublayer, attr, None)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 class Residual(nn.Module):
-    """Wrap a sublayer with a pre- or post-LayerNorm residual connection.
+    """Wrap a sublayer with a pre- or post-normalization residual connection.
 
     Works for any sublayer, including GNN message-passing layers that need extra
     arguments such as ``edge_index``: extra positional/keyword args passed to
@@ -14,64 +40,92 @@ class Residual(nn.Module):
         x = Residual(GATConv(d, d), d)(x, edge_index)
 
     The wrapped module is exposed as ``.sublayer``.
+
+    Args:
+        sublayer: The module to wrap (e.g. a ``torch_geometric`` conv).
+        dropout: Dropout applied to the sublayer output before the addition.
+        pre_norm: Apply ``norm`` to ``x`` *before* the sublayer.
+        post_norm: Apply ``norm`` to the sum *after* the residual addition.
+        norm: ``None`` / ``nn.Identity`` (no normalization), an ``nn.Module``
+            *instance*, or a module *class* instantiated with the feature
+            dimension. ``nn.GroupNorm`` is special-cased as ``GroupNorm(1, dim)``
+            (instance-norm-like). See :data:`NORM_REGISTRY` for the names the
+            config layer accepts.
+        hidden_dim: Feature dimension of the sublayer, used to build ``norm``.
+            When omitted it is inferred from the sublayer (``hidden_dim``,
+            ``out_channels``, then ``in_channels``).
+
+    The PyG ``batch`` vector (node -> graph assignment) can be passed to
+    ``forward`` as a keyword argument. Norms that support per-graph statistics
+    (``LayerNorm``, ``GraphNorm``, ``InstanceNorm``) receive it; others
+    (``Identity``, and PyG ``BatchNorm`` in this version) are called with ``x``
+    only. ``batch`` never reaches the wrapped sublayer.
     """
 
     def __init__(
         self,
         sublayer: nn.Module,
-        hidden_dim: int,
         dropout: float = 0.0,
         pre_norm: bool = False,
         post_norm: bool = False,
-        norm: nn.Module = torch.nn.Identity,
+        norm: type[nn.Module] | nn.Module | None = None,
+        hidden_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.sublayer = sublayer
-        # `norm` is a module *class*; instantiate it (Identity takes no args).
-        if isinstance(norm, nn.Module):
+        if norm is None or norm is nn.Identity:
+            self.norm = nn.Identity()
+        elif isinstance(norm, nn.Module):
             self.norm = norm
-        elif norm is torch.nn.Identity:
-            self.norm = norm()
         else:
-            self.norm = norm(hidden_dim)
+            dim = hidden_dim or _resolve_sublayer_dim(sublayer)
+            if dim is None:
+                raise ValueError(
+                    "cannot infer the feature dimension to build the norm; "
+                    "pass `hidden_dim` or provide a norm instance"
+                )
+            self.norm = nn.GroupNorm(1, dim) if norm is nn.GroupNorm else norm(dim)
         self.dropout = nn.Dropout(dropout)
         self.pre_norm = pre_norm
         self.post_norm = post_norm
+        # Some norms (PyG graph norms like LayerNorm / GraphNorm / InstanceNorm)
+        # take a `batch` vector for per-graph statistics; detect it so we know
+        # whether to pass `batch` at call time. (PyG BatchNorm here does not.)
+        self._norm_accepts_batch = (
+            "batch" in inspect.signature(self.norm.forward).parameters
+        )
+
+    def _apply_norm(self, x: torch.Tensor, batch: torch.Tensor | None) -> torch.Tensor:
+        """Apply ``self.norm`` to ``x``, forwarding the PyG ``batch`` vector when
+        the norm supports it (per-graph statistics)."""
+        if batch is not None and self._norm_accepts_batch:
+            return self.norm(x, batch)
+        return self.norm(x)
+
+    def reset_parameters(self) -> None:
+        if hasattr(self.sublayer, "reset_parameters"):
+            self.sublayer.reset_parameters()
+        if hasattr(self.norm, "reset_parameters"):
+            self.norm.reset_parameters()
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        # `batch` (PyG node->graph assignment) is consumed by the norm for
+        # per-graph statistics and never forwarded to the sublayer (conv).
+        batch = kwargs.pop("batch", None)
+        logger.debug(
+            "Residual.forward(norm=%s, pre_norm=%s, post_norm=%s, batch=%s)",
+            type(self.norm).__name__,
+            self.pre_norm,
+            self.post_norm,
+            batch is not None,
+        )
         if self.pre_norm:
-            x = self.norm(x)
+            x = self._apply_norm(x, batch)
         h = self.dropout(self.sublayer(x, *args, **kwargs))
         h = x + h
         if self.post_norm:
-            h = self.norm(h)
+            h = self._apply_norm(h, batch)
         return h
-
-
-class AttentionResidual(Residual):
-    """A residual wrapper specialized for attention / GNN sublayers.
-
-    The wrapped module stays reachable as ``.sublayer``, so for example
-    ``block.attention.sublayer.lin_l`` works for a wrapped ``GATConv``.
-    """
-
-    def __init__(
-        self,
-        attention: nn.Module,
-        hidden_dim: int,
-        dropout: float = 0.0,
-        pre_norm: bool = True,
-        post_norm: bool = False,
-        norm: nn.Module = torch.nn.Identity,
-    ) -> None:
-        super().__init__(
-            attention,
-            hidden_dim,
-            dropout=dropout,
-            pre_norm=pre_norm,
-            post_norm=post_norm,
-            norm=norm,
-        )
 
 
 class FeedForward(nn.Module):
@@ -101,7 +155,7 @@ class HistoryAttention(nn.Module):
 
     Instead of combining the outputs of all previous layers with a plain sum,
     this computes attention weights over the history and multiplies them with
-    the (value-projected) history, following the LLM ``softmax(QK^T/\sqrt{d}) V``
+    the (value-projected) history, following the LLM ``softmax(QK^T/\\sqrt{d}) V``
     pattern but across the *layer* dimension::
 
         e_l  = (W_q q) . (W_k h_l) / sqrt(d)
@@ -142,7 +196,7 @@ class HistoryAttention(nn.Module):
         scores = (q * k).sum(-1) * self.invsqrt_hiddendim  # (L, N)
         weights = F.softmax(scores, dim=0)  # (L, N)
         weights = self.dropout(weights)
-        return (weights.unsqueeze(-1) * history).sum(dim=0)  # (N, d)
+        return (weights.unsqueeze(-1) * v).sum(dim=0)  # (N, d)
 
 
 class HistoryBlock(nn.Module):
@@ -198,6 +252,7 @@ class HistoryBlock(nn.Module):
         # First call seeds the history with the input embeddings.
         if not self._history:
             self._history.append(x)
+        logger.debug("HistoryBlock.forward history length=%d", len(self._history))
         # Full attention: combine the outputs of EVERY previous layer using
         # softmax weights (softmax multiplied with the history), then run the
         # spatial GNN attention + feed-forward on the result.

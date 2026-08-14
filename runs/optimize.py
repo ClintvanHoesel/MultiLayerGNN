@@ -6,7 +6,7 @@ Drives :mod:`run_training`'s building blocks with an Optuna study. Every trial:
 2. builds a ``ScalarMoleculeModel`` + ``SimpleLightningMoleculeModule``,
 3. trains for a capped number of epochs with early stopping (and optional
    Optuna pruning), and
-4. returns a validation objective (default ``val_mae``) to minimize.
+4. returns a validation objective (default ``val_mae``; ``val_r2`` maximizes).
 
 The best config is written to ``<outdir>/hpo/best_config.yaml``, ready to feed
 straight back into ``run_training.py --config``.
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import logging
 import os
 import sys
 from datetime import datetime
@@ -37,6 +38,16 @@ from datetime import datetime
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
+
+# Configure the package logger before importing morphology_gnn (via run_training)
+# so import-time warnings (e.g. CUDA fallback) are captured. Level comes from
+# MGN_LOG_LEVEL, else WARNING; upgraded to INFO (or --log-level) in main().
+from morphology_gnn._logging import configure_logging  # noqa: E402
+
+configure_logging(level=os.environ.get("MGN_LOG_LEVEL"))
+
+# Stdlib logger for the CLI (named `log` to avoid clashing with Lightning loggers).
+log = logging.getLogger("morphology_gnn.runs.optimize")
 
 import lightning.pytorch as pl
 import optuna
@@ -49,12 +60,19 @@ from run_training import (  # noqa: E402  (sys.path fix above)
     CombinedH5MolecularDataset,
     _ensure_wandb_auth,
     _finalize_wandb,
+    _log_config_to_wandb,
+    _log_yaml_files_to_wandb,
     _make_run_name,
     build_loaders,
     build_model,
     build_module,
+    compute_metrics,
     deep_merge,
+    fit_target_scaler,
     load_config,
+    normalize_targets,
+    require_radius,
+    sanitize_name,
     set_nested,
     set_seed,
 )
@@ -67,33 +85,35 @@ from run_training import (  # noqa: E402  (sys.path fix above)
 #   log_float:   {"type": "log_float", "low": ..., "high": ...}
 #   log_int:     {"type": "log_int", "low": ..., "high": ...}
 _DEFAULT_SEARCH_SPACE = {
-    "model.hidden_dim": {"type": "categorical", "choices": [64, 128, 256]},
+    # "model.hidden_dim": {"type": "categorical", "choices": [64, 128, 256]},
     "model.num_layers": {"type": "int", "low": 1, "high": 4},
-    "model.heads": {"type": "categorical", "choices": [1, 2, 4, 8]},
-    "model.num_rbf": {"type": "categorical", "choices": [25, 50, 75, 100]},
-    "model.dropout": {"type": "float", "low": 0.0, "high": 0.5},
-    "model.act": {
-        "type": "categorical",
-        "choices": ["gelu", "mish", "relu", "silu"],
-    },
-    "model.conv_class": {
-        "type": "categorical",
-        "choices": ["GATConv", "GCNConv", "SAGEConv"],
-    },
-    "model.use_edge_features": {
-        "type": "categorical",
-        "choices": [False, True],
-    },
-    "training.lr": {"type": "log_float", "low": 1e-5, "high": 1e-2},
-    "training.batch_size": {"type": "categorical", "choices": [16, 32, 64]},
-    "training.weight_decay": {"type": "log_float", "low": 1e-6, "high": 1e-2},
-    "training.optimizer_class": {
-        "type": "categorical",
-        "choices": ["Adam", "AdamW"],
-    },
+    # "model.heads": {"type": "categorical", "choices": [1, 2, 4, 8]},
+    # "model.num_rbf": {"type": "categorical", "choices": [25, 50, 75, 100]},
+    # "model.dropout": {"type": "float", "low": 0.0, "high": 0.5},
+    # "model.act": {
+    #     "type": "categorical",
+    #     "choices": ["gelu", "mish", "relu", "silu"],
+    # },
+    # "model.conv_class": {
+    #     "type": "categorical",
+    #     "choices": ["GATConv", "GCNConv", "SAGEConv"],
+    # },
+    # "model.use_edge_features": {
+    #     "type": "categorical",
+    #     "choices": [False, True],
+    # },
+    # "training.lr": {"type": "log_float", "low": 1e-5, "high": 1e-2},
+    # "training.batch_size": {"type": "categorical", "choices": [16, 32, 64]},
+    # "training.weight_decay": {"type": "log_float", "low": 1e-6, "high": 1e-2},
+    # "training.optimizer_class": {
+    #     "type": "categorical",
+    #     "choices": ["Adam", "AdamW"],
+    # },
 }
 
-OBJECTIVE_CHOICES = ("val_mae", "val_loss")
+# val_mae / val_loss are lower-better; val_r2 is higher-better (the script
+# auto-sets the study direction to maximize when val_r2 is selected).
+OBJECTIVE_CHOICES = ("val_mae", "val_loss", "val_r2")
 
 # Cache datasets per (files, target, radius) so HPO trials don't re-parse HDF5.
 _DATASET_CACHE: dict = {}
@@ -140,28 +160,30 @@ def _get_dataset(config: dict) -> CombinedH5MolecularDataset:
     files = config["data"]
     if isinstance(files, str):
         files = [files]
-    key = (tuple(files), config["target"], float(config["radius"]))
+    targets = normalize_targets(config["target"])
+    key = (tuple(files), tuple(targets), float(config["radius"]))
     if key not in _DATASET_CACHE:
         _DATASET_CACHE[key] = CombinedH5MolecularDataset(
-            list(files), config["target"], radius=config["radius"]
+            list(files), targets, radius=config["radius"]
         )
     return _DATASET_CACHE[key]
 
 
-def _evaluate(module, loader) -> tuple[float, float]:
-    """Mean MSE and MAE over a loader (deterministic; used as the objective)."""
+def _evaluate(module, loader, targets=None) -> dict:
+    """Aggregate + per-target metrics over a loader (deterministic)."""
     module.eval()
     device = next(module.parameters()).device
-    n, mse, mae = 0, 0.0, 0.0
+    ys, preds = [], []
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
-            y_hat = module(batch).view(-1)
-            y = batch.y.view(-1)
-            mse += F.mse_loss(y_hat, y, reduction="sum").item()
-            mae += F.l1_loss(y_hat, y, reduction="sum").item()
-            n += y.numel()
-    return mse / n, mae / n
+            y_hat = module(batch)  # (num_graphs, num_targets), standardized
+            # PyG flattens per-graph `y` (T,) into (B*T,) when batching; reshape
+            # back to (num_graphs, num_targets) so it aligns with the model head.
+            ys.append(batch.y.view_as(y_hat))
+            # Un-standardize predictions into the original target units.
+            preds.append(module.denormalize_targets(y_hat))
+    return compute_metrics(torch.cat(ys), torch.cat(preds), targets)
 
 
 def _build_trial_logger(trial, trial_config, args, study_name):
@@ -188,13 +210,20 @@ def _build_trial_logger(trial, trial_config, args, study_name):
 
 
 class _PruneCallback(pl.Callback):
-    """Report the objective each validation epoch so Optuna can prune trials."""
+    """Report the objective each validation epoch so Optuna can prune trials.
 
-    def __init__(self, trial, metric: str) -> None:
+    Never prunes before ``min_epochs`` epochs so the noisy early-training phase
+    cannot kill a promising trial (the main reason pruning felt "too strict").
+    """
+
+    def __init__(self, trial, metric: str, min_epochs: int = 0) -> None:
         self.trial = trial
         self.metric = metric
+        self.min_epochs = min_epochs
 
     def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.current_epoch < self.min_epochs:
+            return
         value = trainer.callback_metrics.get(self.metric)
         if value is None:
             return
@@ -212,6 +241,9 @@ def _make_objective(base_config, search_space, args, study_name):
         trial_config = copy.deepcopy(base_config)
         for path, value in _suggest(search_space, trial).items():
             set_nested(trial_config, path, value)
+        # Multi-target: the model head outputs one value per target property.
+        targets = normalize_targets(trial_config["target"])
+        trial_config["model"]["num_targets"] = len(targets)
 
         # GCNConv / SAGEConv have no `edge_dim`; skip edge features for them so
         # sampled trials never crash (ScalarMoleculeModel would raise).
@@ -236,8 +268,18 @@ def _make_objective(base_config, search_space, args, study_name):
             dataset, trial_config["training"]
         )
 
-        model = build_model(trial_config["model"])
-        system = build_module(model, trial_config["training"])
+        target_mean = target_std = None
+        if trial_config["training"].get("normalize_targets", True):
+            target_mean, target_std = fit_target_scaler(train_loader, len(targets))
+        model = build_model(trial_config["model"], radius=trial_config["radius"])
+        system = build_module(
+            model,
+            trial_config["training"],
+            target_tags=[sanitize_name(t) for t in targets],
+            target_mean=target_mean,
+            target_std=target_std,
+            config=trial_config,
+        )
 
         callbacks = [
             EarlyStopping(
@@ -247,7 +289,9 @@ def _make_objective(base_config, search_space, args, study_name):
             )
         ]
         if not args.no_prune:
-            callbacks.append(_PruneCallback(trial, args.objective))
+            callbacks.append(
+                _PruneCallback(trial, args.objective, min_epochs=args.prune_min_epochs)
+            )
 
         logger = _build_trial_logger(trial, trial_config, args, study_name)
         trainer = pl.Trainer(
@@ -266,11 +310,30 @@ def _make_objective(base_config, search_space, args, study_name):
             _finalize_wandb(logger)
             raise
 
-        val_loss, val_mae = _evaluate(system, val_loader)
+        # Attach the full trial config + source YAML files to the per-trial W&B
+        # run (Overview -> Config + Files tab).
+        if args.wandb_project:
+            _log_config_to_wandb(trial_config)
+            _log_yaml_files_to_wandb(trial_config)
+
+        metrics = _evaluate(system, val_loader, targets)
+        val_loss, val_mae, val_r2 = metrics["mse"], metrics["mae"], metrics["r2"]
         trial.set_user_attr("val_loss", val_loss)
         trial.set_user_attr("val_mae", val_mae)
+        trial.set_user_attr("val_r2", val_r2)
+        for i, tk in enumerate(targets):
+            tag = sanitize_name(tk)
+            for metric in ("mse", "mae", "rmse", "r2"):
+                trial.set_user_attr(
+                    f"val_{tag}_{metric}", metrics[f"target_{i}_{metric}"]
+                )
         trial.set_user_attr("seed", seed)
-        value = val_mae if args.objective == "val_mae" else val_loss
+        if args.objective == "val_mae":
+            value = val_mae
+        elif args.objective == "val_r2":
+            value = val_r2
+        else:
+            value = val_loss
         _finalize_wandb(logger)
         return value
 
@@ -305,9 +368,17 @@ def parse_args(argv=None):
     parser.add_argument(
         "--patience", type=int, default=15, help="Early-stopping patience per trial."
     )
-    parser.add_argument("--objective", choices=OBJECTIVE_CHOICES, default="val_mae")
     parser.add_argument(
-        "--direction", choices=("minimize", "maximize"), default="minimize"
+        "--objective",
+        choices=OBJECTIVE_CHOICES,
+        default="val_mae",
+        help="val_mae / val_loss (minimize) or val_r2 (maximize; auto-forced).",
+    )
+    parser.add_argument(
+        "--direction",
+        choices=("minimize", "maximize"),
+        default="minimize",
+        help="Optimization direction (auto-set to maximize for val_r2).",
     )
     parser.add_argument(
         "--storage",
@@ -338,6 +409,24 @@ def parse_args(argv=None):
         "--no-prune", action="store_true", help="Disable Optuna pruning."
     )
     parser.add_argument(
+        "--prune-startup-trials",
+        type=int,
+        default=10,
+        help="Completed trials before MedianPruner starts pruning (higher = less strict).",
+    )
+    parser.add_argument(
+        "--prune-warmup-steps",
+        type=int,
+        default=30,
+        help="Epochs a trial trains before the pruner may consider it (higher = less strict).",
+    )
+    parser.add_argument(
+        "--prune-min-epochs",
+        type=int,
+        default=10,
+        help="Never prune a trial before this many epochs (keeps noisy early epochs).",
+    )
+    parser.add_argument(
         "--no-progress-bar",
         action="store_true",
         help="Hide Lightning progress bars.",
@@ -345,12 +434,22 @@ def parse_args(argv=None):
     parser.add_argument(
         "--seed", type=int, default=None, help="Override base training.seed."
     )
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        help="Log level: DEBUG, INFO, WARNING, ERROR (default: config logging.level).",
+    )
     return parser.parse_args(argv)
 
 
 # --- main ---------------------------------------------------------------------
 def main() -> None:
     args = parse_args()
+    # val_r2 is higher-better; make the study maximize it unless the user
+    # explicitly chose a direction.
+    if args.objective == "val_r2" and args.direction != "maximize":
+        log.info("[hpo] note: val_r2 is higher-better; setting --direction maximize")
+        args.direction = "maximize"
 
     cfg_path = args.config
     if not os.path.isabs(cfg_path):
@@ -360,6 +459,17 @@ def main() -> None:
     base_config = deep_merge(copy.deepcopy(DEFAULT_CONFIG), load_config(cfg_path))
     if args.seed is not None:
         base_config["training"]["seed"] = args.seed
+    # Multi-target: reflect the output head size in the config (and the written
+    # best_config.yaml); the objective also sets it per trial.
+    base_config["model"]["num_targets"] = len(normalize_targets(base_config["target"]))
+    # The radius-graph cutoff must be chosen manually; cutoff_upper defaults to it.
+    require_radius(base_config)
+    # Apply the resolved level (--log-level wins; else logging.level; else INFO)
+    # and optional file output. Handlers were added at import time.
+    configure_logging(
+        level=args.log_level or base_config["logging"].get("level") or "INFO",
+        log_file=base_config["logging"].get("log_file"),
+    )
     set_seed(base_config["training"]["seed"])
 
     outdir = args.outdir or base_config["logging"]["outdir"]
@@ -374,7 +484,14 @@ def main() -> None:
     sampler = optuna.samplers.TPESampler(
         seed=base_config["training"]["seed"], n_startup_trials=5
     )
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=5)
+    pruner = (
+        optuna.pruners.NopPruner()
+        if args.no_prune
+        else optuna.pruners.MedianPruner(
+            n_startup_trials=args.prune_startup_trials,
+            n_warmup_steps=args.prune_warmup_steps,
+        )
+    )
     study = optuna.create_study(
         study_name=study_name,
         storage=storage,
@@ -384,10 +501,20 @@ def main() -> None:
         load_if_exists=args.resume,
     )
 
-    print(
-        f"[hpo] study={study_name} storage={storage} "
-        f"n_trials={args.n_trials} objective={args.objective} "
-        f"direction={args.direction}"
+    log.info(
+        "[hpo] study=%s storage=%s n_trials=%d objective=%s direction=%s",
+        study_name,
+        storage,
+        args.n_trials,
+        args.objective,
+        args.direction,
+    )
+    log.info(
+        "[hpo] pruning=%s startup_trials=%d warmup_steps=%d min_epochs=%d",
+        "off" if args.no_prune else "median",
+        args.prune_startup_trials,
+        args.prune_warmup_steps,
+        args.prune_min_epochs,
     )
 
     objective = _make_objective(base_config, search_space, args, study_name)
@@ -400,9 +527,9 @@ def main() -> None:
     )
 
     best = study.best_trial
-    print(f"[hpo] best trial={best.number} {args.objective}={best.value:.6f}")
+    log.info("[hpo] best trial=%d %s=%.6f", best.number, args.objective, best.value)
     for key, value in best.params.items():
-        print(f"      {key.replace('__', '.')} = {value}")
+        log.info("      %s = %s", key.replace("__", "."), value)
 
     # Write the best config back as YAML for `run_training.py --config`.
     best_config = copy.deepcopy(base_config)
@@ -418,21 +545,22 @@ def main() -> None:
     best_path = os.path.join(hpo_dir, "best_config.yaml")
     with open(best_path, "w") as f:
         yaml.safe_dump(best_config, f, sort_keys=False)
-    print(f"[hpo] best config written to {best_path}")
-    print(
+    log.info("[hpo] best config written to %s", best_path)
+    log.info(
         "[hpo] launch the full run with:\n"
-        f"  conda run -n torch python runs/run_training.py --config {best_path}"
+        "  conda run -n torch python runs/run_training.py --config %s",
+        best_path,
     )
 
     # Parameter importances (best-effort; needs >= 2 completed trials).
     importances = {}
     try:
         importances = optuna.importance.get_param_importances(study)
-        print("[hpo] parameter importances:")
+        log.info("[hpo] parameter importances:")
         for param, imp in sorted(importances.items(), key=lambda kv: -kv[1]):
-            print(f"      {param.replace('__', '.')}: {imp:.3f}")
+            log.info("      %s: %.3f", param.replace("__", "."), imp)
     except Exception as exc:
-        print(f"[hpo] (could not compute importances: {exc})")
+        log.info("[hpo] (could not compute importances: %s)", exc)
 
     # Optional W&B study summary.
     if args.wandb_project:
@@ -451,11 +579,14 @@ def main() -> None:
                 "best_params": best.params,
             },
         )
-        log = {f"best_{args.objective}": best.value}
-        for key in ("val_loss", "val_mae"):
+        # Full best config + source YAML files on the study run.
+        _log_config_to_wandb(best_config)
+        _log_yaml_files_to_wandb(best_config)
+        wandb_log = {f"best_{args.objective}": best.value}
+        for key in ("val_loss", "val_mae", "val_r2"):
             if key in best.user_attrs:
-                log[f"best_{key}"] = best.user_attrs[key]
-        wandb.log(log)
+                wandb_log[f"best_{key}"] = best.user_attrs[key]
+        wandb.log(wandb_log)
         if importances:
             table = wandb.Table(
                 columns=["param", "importance"],

@@ -1,5 +1,9 @@
+import logging
+
 import h5py
 import sys
+
+logger = logging.getLogger(__name__)
 
 if sys.version_info < (3,):
     RANGE_TYPE = list
@@ -54,7 +58,9 @@ def load(chkfile, key):
         else:
             return val[()]
 
+    logger.debug("loading key %r from %s", key, chkfile)
     with h5py.File(chkfile, "r") as fh5:
+        logger.debug("opened %s; top-level keys=%s", chkfile, list(fh5.keys()))
         return load_as_dic(key, fh5)
 
 

@@ -11,62 +11,121 @@
 
 # One or more HDF5 files (same layout, same target key).
 data:
-  - data/2-TNATA_ams.hdf5
+  - data/BCP.hdf5
 
-# Target property key within each HDF5 group.
-target: "Positive VIP"
+# Target property key(s) within each HDF5 group. Use a single string for one
+# property, or a list to train on several at once (the model outputs one value
+# per target; loss/metrics average over all of them).
+target: "HOMO"
+# target: ["Positive VIP", "HOMO"]
 
-# Radius-graph cutoff (Angstrom).
-radius: 6.0
+# Radius-graph cutoff (Angstrom). REQUIRED — no default: every run must set it
+# manually (here, or with --radius). This is the cutoff for building edges
+# between atoms (radius_graph / radius_graph_pbc).
+radius: 3.0
 
 model:
-  hidden_dim: 128
+  hidden_dim: 256
   num_layers: 2
   # Attention heads (only used when conv_class is GATConv).
-  heads: 8
+  heads: 5
   num_rbf: 50
-  use_edge_features: false
+  # Use geometric edge features (bond distances via RBF). For a single molecule
+  # with near-identical frames, plain mean-pooled atom embeddings are almost the
+  # same across samples, so the model cannot even overfit; edge distances are
+  # what lets it distinguish frames and drive the training loss down.
+  use_edge_features: true
   conv_class: GATConv
   # Extra kwargs for every conv layer (e.g. GATConv: {"concat": False}).
   conv_kwargs: {}
   # Deep kwargs passed to AtomTypeEmbedding (e.g. padding_idx).
   atom_emb_kwargs: {}
-  # Deep kwargs passed to DistanceEmbedding (e.g. cutoff_upper, rbf_class).
+  # Deep kwargs passed to the RBF distance embedding (DistanceEmbedding): any of
+  # cutoff_lower / cutoff_upper / num_rbf / rbf_class / trainable, e.g.
+  # {cutoff_upper: 5.0, rbf_class: ExpNormalSmearing}. Explicit cutoff keys here
+  # take precedence over the first-class cutoff_lower / cutoff_upper below.
   rbf_kwargs: {}
+  # First-class RBF distance-embedding cutoffs (used when use_edge_features is
+  # true). cutoff_upper is optional — when omitted (null) it defaults to the
+  # radius-graph cutoff (`radius`). cutoff_lower defaults to 0.0.
+  cutoff_lower: 0.0
+  cutoff_upper: null            # optional -> defaults to `radius`
+  # Whether to wrap each conv layer in a Residual connection.
+  use_residual: true
+  # Normalization type applied inside the residual wrapper (first-class knob).
+  # Choices (torch_geometric.nn.norm): Identity (default), LayerNorm, BatchNorm,
+  # GraphNorm, InstanceNorm. Extra kwargs for the chosen class go in norm_kwargs
+  # (e.g. {track_running_stats: false} for BatchNorm). Takes effect only when
+  # use_residual is true; residual_kwargs.norm overrides this.
+  norm: graphnorm
+  norm_kwargs: {}
+  # Number of output values per graph (one per target property). Set
+  # automatically from the number of `target` properties; override only for
+  # setups not driven by the target list.
+  # num_targets: 1
+  # Options passed to the Residual wrapper (dropout, pre/post norm placement).
+  residual_kwargs:
+    dropout: 0.
+    pre_norm: true
+    post_norm: false
   # Optional: activation name ("gelu", "mish", "relu", "silu", "tanh").
   # act: gelu
-  # Optional: global aggregation ("MeanAggregation", "SumAggregation", "MaxAggregation").
+  # Optional: node->graph aggregation. A single name ("MeanAggregation",
+  # "SumAggregation", "MaxAggregation"), several combined — either a YAML list
+  # or a "MeanAggregation+MaxAggregation" string (joined with MultiAggregation,
+  # which concatenates their outputs) — or any other torch_geometric.nn.aggr
+  # name (imported on demand, e.g. "AttentionalAggregation", "SoftmaxAggregation").
   # global_aggr: MeanAggregation
 
 training:
-  batch_size: 32
-  lr: 0.0001
+  batch_size: 16
+  lr: 0.001
   weight_decay: 0.0
-  max_epochs: 300
-  patience: 30
+  max_epochs: 1000
+  patience: 100
   val_frac: 0.1
   test_frac: 0.1
   seed: 0
   num_workers: 4
   accelerator: auto
   # Optimizer / scheduler names from the runner registries.
-  optimizer_class: Adam
+  optimizer_class: AdamW
   optimizer_kwargs: {}
   scheduler_class: null          # e.g. ReduceLROnPlateau, StepLR, CosineAnnealingLR, OneCycleLR
   scheduler_kwargs: {}
   scheduler_monitor: val_loss
   scheduler_interval: epoch      # "epoch" or "step" (use "step" for OneCycleLR)
-  # Optional extra regression metrics to log: {name: loss_name}.
-  # extra_metrics: {mae: l1_loss, rmse: mse_loss}
+  # Cross-validation: set k_folds > 1 to run K-fold CV instead of the single
+  # train/val/test split. With several distinct molecules a Group K-fold keeps
+  # whole molecules in the same fold (no train/val leakage); with a single
+  # molecule a repeated shuffled K-fold runs n_repeats passes. 1 / null keeps
+  # the current single split.
+  k_folds: null
+  n_repeats: 3
+  # Standardize the target(s) (per-target mean/std fit on the training split)
+  # before computing the loss; predictions are un-standardized for reporting.
+  # Recommended for near-constant or large-magnitude targets (avoids a
+  # systematic prediction offset). Set to false to train on raw targets.
+  normalize_targets: true
+  # Optional extra regression metrics to log: {name: metric_name}.
+  # Metric names: mse_loss, l1_loss, smooth_l1_loss, mae, rmse, r2.
+  # R² is also logged by default during training (train_r2/val_r2/test_r2) and
+  # reported per split at the end of every run.
+  # extra_metrics: {mae: l1_loss, rmse: mse_loss, r2: r2}
 
 logging:
   outdir: runs/artifacts
   # Set to a W&B project name to enable W&B logging. When enabled, the run gets
   # a human-friendly auto-generated name from the hyperparameters (see
   # run_training._make_run_name); override it with `run_name` below.
-  wandb_project: null
+  wandb_project: ScalarGNNAmsData
   # Optional W&B niceties:
   run_name: null             # e.g. "gat-h256-l4-r6.0" (auto if null)
-  group: null                # group related runs together in the W&B UI
+  group: 2TNATA_hyperopt                # group related runs together in the W&B UI
   tags: null                 # e.g. [baseline, gat]  (list)
   notes: null                # free-text description shown on the run page
+  # Stdlib logging for the library + CLI (morphology_gnn._logging.configure_logging).
+  # level: WARNING (silent) | INFO (default) | DEBUG (verbose) | ERROR.
+  level: INFO
+  # Optional path to also write logs to a file (e.g. runs/artifacts/train.log).
+  log_file: null

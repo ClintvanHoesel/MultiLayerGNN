@@ -1,5 +1,9 @@
+import logging
 import math
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 # https://github.com/atomicarchitects/equiformer_v3/blob/main/experimental/models/equiformer_v3/envelope.py

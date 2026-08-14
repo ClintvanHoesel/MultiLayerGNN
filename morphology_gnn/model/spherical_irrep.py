@@ -1,4 +1,8 @@
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class RadialFunction(torch.nn.Module):
@@ -23,6 +27,12 @@ class RadialFunction(torch.nn.Module):
         use_expand=True,
     ):
         super().__init__()
+        logger.debug(
+            "RadialFunction(channels_list=%s, lmax=%s, mmax=%s)",
+            channels_list,
+            lmax,
+            mmax,
+        )
         modules = []
         input_channels = channels_list[0]
         for i in range(len(channels_list)):
