@@ -68,11 +68,192 @@ def min_image_disp(
     disp = pos[dst] - pos[src]  # (E, 3)
     if is_orthorhombic:
         return disp - torch.round(disp / box) * box
-    # General lattice: minimum image in fractional coordinates.
+    # General lattice: minimum image in fractional coordinates. DOES NOT ALWAYS WORK
     inv_lattice = torch.linalg.inv(lattice.to(pos.dtype).to(device))
     frac = disp @ inv_lattice  # (E, 3)
     frac = frac - torch.round(frac)
     return frac @ lattice.to(pos.dtype).to(device)
+
+
+def wrap_pos_general(pos: torch.Tensor, lattice: torch.Tensor) -> torch.Tensor:
+    """Wrap Cartesian positions into the periodic cell for a general ``(3, 3)`` lattice.
+
+    Positions are mapped to fractional coordinates, wrapped into ``[0, 1)`` and
+    mapped back to Cartesian — the generalization of :func:`wrap_pos` to
+    non-orthorhombic cells.
+    """
+    lattice = lattice.to(pos.dtype).to(pos.device)
+    inv_lattice = torch.linalg.inv(lattice)
+    frac = pos @ inv_lattice
+    frac = frac - torch.floor(frac)
+    return frac @ lattice
+
+
+def _min_image_delta(
+    delta: torch.Tensor,
+    lattice: torch.Tensor,
+    box: torch.Tensor,
+    is_orthorhombic: bool,
+) -> torch.Tensor:
+    """Shortest periodic displacement for a difference vector ``delta``.
+
+    Same minimum-image convention as :func:`min_image_disp`: orthorhombic boxes
+    use the vectorized ``round`` trick, general lattices the fractional-coordinate
+    rounding. The caller decides which path via ``is_orthorhombic`` (from
+    :func:`_normalize_lattice`) so the two are consistent with the rest of the
+    PBC machinery.
+    """
+    if is_orthorhombic:
+        box = box.to(delta.dtype).to(delta.device)
+        return delta - torch.round(delta / box) * box
+    lattice = lattice.to(delta.dtype).to(delta.device)
+    inv_lattice = torch.linalg.inv(lattice)
+    frac = delta @ inv_lattice
+    frac = frac - torch.round(frac)
+    return frac @ lattice
+
+
+def _unwrap_by_reference(
+    pos: torch.Tensor, lattice: torch.Tensor, box: torch.Tensor, is_orthorhombic: bool
+) -> torch.Tensor:
+    """Minimum-image unwrap of every atom relative to the wrapped geometric centroid.
+
+    The wrapped centroid is a point inside the cell around which the molecule is
+    roughly centered; bringing each atom to the image nearest it "pulls the
+    molecule together" into a contiguous blob. Requires the cell to be larger
+    than the molecule's extent (else the minimum image is ambiguous).
+    """
+    c = pos.mean(dim=0)
+    delta = _min_image_delta(pos - c, lattice, box, is_orthorhombic)
+    return c + delta
+
+
+def _unwrap_by_bonds(
+    pos: torch.Tensor,
+    bonds: torch.Tensor,
+    lattice: torch.Tensor,
+    box: torch.Tensor,
+    is_orthorhombic: bool,
+) -> torch.Tensor:
+    """Unwrap by walking the bond graph: place each atom next to a placed bonded neighbor.
+
+    Starts a new connected component at every not-yet-visited atom, so partial or
+    multi-component bond lists still produce a valid unwrap (components are kept
+    at their wrapped positions relative to one another). This is more robust than
+    :func:`_unwrap_by_reference` when the molecule spans more than half the cell.
+    """
+    N = pos.shape[0]
+    arr = bonds.to(dtype=torch.long, device=pos.device) if bonds.dim() == 2 else bonds
+    adj: list[list[int]] = [[] for _ in range(N)]
+    for a, b in zip(arr[:, 0].tolist(), arr[:, 1].tolist()):
+        if a != b and 0 <= a < N and 0 <= b < N:
+            adj[a].append(b)
+            adj[b].append(a)
+    out = pos.clone()
+    visited = torch.zeros(N, dtype=torch.bool, device=pos.device)
+    for start in range(N):
+        if visited[start]:
+            continue
+        visited[start] = True
+        stack = [start]
+        while stack:
+            u = stack.pop()
+            for v in adj[u]:
+                if visited[v]:
+                    continue
+                delta = _min_image_delta(pos[v] - out[u], lattice, box, is_orthorhombic)
+                out[v] = out[u] + delta
+                visited[v] = True
+                stack.append(v)
+    return out
+
+
+def unwrap_molecule(
+    pos: torch.Tensor,
+    lattice: torch.Tensor,
+    bonds: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Unwrap a PBC-wrapped molecule into a contiguous spatial arrangement.
+
+    Atoms that sit across the periodic boundary are pulled back next to the rest
+    of the molecule so the whole molecule forms a connected blob. When a bond
+    list is provided the connectivity graph is walked (:func:`_unwrap_by_bonds`)
+    to place every atom next to an already-placed bonded neighbor — the most
+    robust path when a molecule spans more than half the cell. Otherwise each
+    atom is brought to the minimum-image position relative to the wrapped
+    geometric centroid (:func:`_unwrap_by_reference`).
+
+    Args:
+        pos: Wrapped atom positions, shape ``(N, 3)``.
+        lattice: ``(3,)`` box lengths or ``(3, 3)`` lattice matrix.
+        bonds: Optional connectivity — ``(E, 2)`` index pairs. Used for the
+            graph-based unwrap when provided.
+
+    Returns:
+        Unwrapped positions of shape ``(N, 3)`` (the overall translation is
+        arbitrary; only the shape is meaningful).
+    """
+    pos = pos.float()
+    lattice = lattice.to(dtype=pos.dtype, device=pos.device)
+    box, is_orthorhombic = _normalize_lattice(lattice)
+    box = box.to(dtype=pos.dtype, device=pos.device)
+    if bonds is not None:
+        arr = (
+            bonds
+            if isinstance(bonds, torch.Tensor)
+            else torch.as_tensor(bonds, dtype=torch.long, device=pos.device)
+        )
+        if arr.numel() > 0:
+            return _unwrap_by_bonds(pos, arr, lattice, box, is_orthorhombic)
+    return _unwrap_by_reference(pos, lattice, box, is_orthorhombic)
+
+
+def pbc_center_of_mass(
+    pos: torch.Tensor,
+    lattice: torch.Tensor,
+    masses: torch.Tensor | None = None,
+    bonds: torch.Tensor | None = None,
+    wrap: bool = True,
+) -> torch.Tensor:
+    """Mass-weighted center of mass of a molecule under periodic boundary conditions.
+
+    The molecule is first unwrapped (:func:`unwrap_molecule`) so atoms that
+    cross the periodic boundary are brought back to a contiguous spatial
+    arrangement, then the (mass-weighted) mean position is computed. When
+    ``wrap=True`` the result is folded back into the cell so it can be compared
+    with the values stored under ``molecules/position`` in the SCM-pure HDF5
+    files.
+
+    Args:
+        pos: Wrapped atom positions, shape ``(N, 3)``.
+        lattice: ``(3,)`` box lengths or ``(3, 3)`` lattice matrix.
+        masses: Per-atom weights, shape ``(N,)``. ``None`` computes the plain
+            geometric centroid.
+        bonds: Optional connectivity ``(E, 2)`` index pairs for the graph-based
+            unwrap.
+        wrap: Fold the COM back into the cell ``[0, box)``.
+
+    Returns:
+        The center of mass, shape ``(3,)``.
+    """
+    unwrapped = unwrap_molecule(pos, lattice, bonds=bonds)
+    if masses is None:
+        com = unwrapped.mean(dim=0)
+    else:
+        m = torch.as_tensor(
+            masses, dtype=unwrapped.dtype, device=unwrapped.device
+        ).reshape(-1)
+        if m.numel() != unwrapped.shape[0]:
+            raise ValueError(
+                f"masses must have one entry per atom ({unwrapped.shape[0]}); "
+                f"got {m.numel()}"
+            )
+        com = (unwrapped * m.unsqueeze(-1)).sum(dim=0) / m.sum().clamp_min(1e-12)
+    if wrap:
+        box, is_orthorhombic = _normalize_lattice(lattice)
+        box = box.to(dtype=com.dtype, device=com.device)
+        com = wrap_pos(com, box) if is_orthorhombic else wrap_pos_general(com, lattice)
+    return com
 
 
 def rebuild_pbc_edges(

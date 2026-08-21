@@ -107,7 +107,9 @@ def brute_force_min_image_disp(pos, edge_index, box):
     for i in (-1, 0, 1):
         for j in (-1, 0, 1):
             for k in (-1, 0, 1):
-                shift = torch.tensor([i * box[0], j * box[1], k * box[2]], dtype=pos.dtype)
+                shift = torch.tensor(
+                    [i * box[0], j * box[1], k * box[2]], dtype=pos.dtype
+                )
                 cand = disp - shift
                 cnorm = cand.norm(dim=-1)
                 better = cnorm < best_norm
@@ -169,7 +171,9 @@ def test_rebuild_pbc_edges_matches_per_graph():
     ref = torch.cat([e0, e1], dim=1)
     assert torch.equal(ei, ref)
     # works with (B, 3, 3) lattice matrices too
-    ei_mat = rebuild_pbc_edges(pos, batch, torch.stack([torch.diag(b) for b in box]), 4.0)
+    ei_mat = rebuild_pbc_edges(
+        pos, batch, torch.stack([torch.diag(b) for b in box]), 4.0
+    )
     assert torch.equal(ei_mat, ref)
 
 
@@ -289,8 +293,18 @@ def test_batch_box_robust_to_3vec_collation():
     """A (3,) box stored per graph collates to (B*3,); the helper reshapes."""
     n = 8
     data = [
-        Data(x=torch.randint(1, 7, (n, 1)), pos=torch.rand(n, 3), y=torch.zeros(1), box=torch.tensor([10.0, 10.0, 10.0])),
-        Data(x=torch.randint(1, 7, (n, 1)), pos=torch.rand(n, 3), y=torch.zeros(1), box=torch.tensor([12.0, 12.0, 12.0])),
+        Data(
+            x=torch.randint(1, 7, (n, 1)),
+            pos=torch.rand(n, 3),
+            y=torch.zeros(1),
+            box=torch.tensor([10.0, 10.0, 10.0]),
+        ),
+        Data(
+            x=torch.randint(1, 7, (n, 1)),
+            pos=torch.rand(n, 3),
+            y=torch.zeros(1),
+            box=torch.tensor([12.0, 12.0, 12.0]),
+        ),
     ]
     b = Batch.from_data_list(data)
     module = DiffusionMoleculeModule(_small_model(), radius=4.0)

@@ -2,6 +2,31 @@
 
 Python scripts for specific training runs, mirroring `notebooks/main.ipynb`.
 
+## Loop over all HDF5 files: `run_training_loop.sh`
+
+Trains on **every** `.hdf5`/`.h5` file in a folder by calling `run_training.py`
+once per file, with per-file output isolation
+(`runs/artifacts/<file-stem>`), so checkpoints and truth-vs-predicted plots
+never overwrite each other. Anything after the script options is passed through
+to `run_training.py` unchanged.
+
+```bash
+# Torch conda env is recommended for the interpreter.
+./runs/run_training_loop.sh \
+    --python /home/clint/miniforge3/envs/torch/bin/python \
+    --data-dir data/data_Daniel \
+    --max_epochs 100 --wandb_project MyProject
+
+# Just print the commands (no training):
+./runs/run_training_loop.sh --dry-run --data-dir data/data_Daniel
+```
+
+Script options: `--data-dir DIR` (default `data/data_Daniel`), `--config FILE`
+(default `runs/config.yaml`), `--python BIN`, `--recursive`, `--stop-on-error`
+(abort on the first failed run; default continues), `--no-outdir-per-file`
+(disable per-file outdir isolation), `--dry-run`. See `--help` for the full
+list. Run `./runs/run_training_loop.sh --help` for details.
+
 ## Runner: `run_training.py`
 
 Config-driven. Loads one or several HDF5 files (`CombinedH5MolecularDataset`),
@@ -28,7 +53,7 @@ python runs/run_training.py --config runs/config.yaml \
     --model.num_layers 4 \
     --model.atom_emb_kwargs.padding_idx 0 \
     --model.cutoff_upper 6.0 \
-    --model.rbf_kwargs.rbf_class ExpNormalSmearing \
+    --model.rbf_kwargs.rbf_class ExpNormalRBF \
     --training.optimizer_kwargs.betas "[0.9, 0.999]" \
     --training.scheduler_class ReduceLROnPlateau \
     --logging.wandb_project InitialGNNtrial
@@ -136,6 +161,79 @@ The run is **explicitly finished** via `wandb.finish()` in a `finally` block
 `crashed` by W&B even though training succeeded. Errors are logged onto the run
 before it is closed, and the truth-vs-predicted figure + final split
 MAE/RMSE/R² are pushed to W&B before finishing.
+
+## Runner: `run_diffusion.py`
+
+Config-driven training of an **SE(3)-equivariant diffusion model**
+(`DiffusionMoleculeModel` / `DiffusionMoleculeModule`): an
+epsilon-prediction DDPM denoiser that learns to generate molecular positions
+inside a periodic cell. After training it conditions on a few reference frames,
+generates new conformations, and reports position metrics (coord RMSE, RDF
+mean-abs-diff, min-pair distances) with plots.
+
+Two dataset layouts (`dataset:` in the config):
+
+- **`molecular`** (default): per-frame MD `*_ams.hdf5` files — the model
+  generates **per-atom positions** (a molecule conformation inside its cell).
+- **`scm`**: SCM-pure boxes (`CombinedSCMDiffusionDataset`) — the model
+  generates the **N molecule center-of-mass positions** (`molecules/position`)
+  that make up the box.
+
+Configuration precedence is identical to `run_training.py`:
+
+```
+built-in defaults  <  config file  <  CLI flags  <  deep overrides
+```
+
+```bash
+# Everything from the config file (SCM mode by default: runs/config_diffusion.yaml)
+python runs/run_diffusion.py --config runs/config_diffusion.yaml
+
+# Molecular (per-atom) mode with explicit cutoff + a few flags
+python runs/run_diffusion.py --config runs/config_diffusion.yaml \
+    --dataset molecular --radius 4.0 --max_epochs 50 --sampling.steps 50
+
+# Deep overrides work too
+python runs/run_diffusion.py --config runs/config_diffusion.yaml \
+    --model.hidden_dim 256 --diffusion.schedule linear --sampling.ddim true
+```
+
+**`radius` is required** (no default), exactly as in `run_training.py`. Note
+that in **SCM mode the graph connects molecule centers**, so use a COM-scale
+cutoff (molecule separation, e.g. 15–25 Å) — not the ~4 Å atomic value used in
+`molecular` mode.
+
+Key flags: `--data <files...> --dataset {molecular,scm} --radius
+--hidden_dim --num_layers --heads --num_rbf --conv_class
+--noise_schedule {cosine,linear} --batch_size --lr --max_epochs --patience
+--seed --num_workers --accelerator --sampling_steps --sampling_ddim
+--sampling_eta --num_samples --num_reference --outdir --wandb_project --run_name`.
+
+Generation settings (`sampling:` section / `--sampling_*` flags / deep
+overrides): `steps` (reverse-diffusion steps, default 100), `ddim`
+(deterministic DDIM instead of the stochastic DDPM update), `eta` (DDIM
+stochasticity), `num_samples` (structures per reference frame),
+`num_reference` (frames to condition on), `seed`.
+
+With SCM data (few boxes per dataset) the validation/test splits can be empty;
+the runner detects this, falls back to monitoring `train_loss`, and evaluates
+generation on the full dataset. Artifacts land in `logging.outdir`
+(`runs/artifacts_diffusion/` by default): best checkpoint,
+`generation_<split>.png` (truth vs generated RDF + RMSD/min-pair histograms),
+`*_generated.npz` (generated structures) and XYZ files for visualization
+(`<split>_sample_<i>.xyz` — for SCM data these are the full reconstructed
+boxes). Use `--wandb-project <name>` to log metrics and plots to W&B; otherwise
+a `CSVLogger` is used.
+
+Quick smoke test (1 epoch, 2 sampling steps, CPU):
+
+```bash
+conda run -n torch python runs/run_diffusion.py --config runs/config_diffusion.yaml \
+    --max_epochs 1 --accelerator cpu --num_workers 0 \
+    --sampling.steps 2 --sampling.num_samples 1 --sampling.num_reference 1
+```
+
+All CLI options are listed with `python runs/run_diffusion.py --help`.
 
 ## Logging
 

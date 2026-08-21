@@ -40,7 +40,10 @@ import torch  # noqa: E402
 from lightning.pytorch.loggers import CSVLogger  # noqa: E402
 from torch_geometric.nn import GATConv  # noqa: E402
 
-from morphology_gnn.data import CombinedH5MolecularDataset  # noqa: E402
+from morphology_gnn.data import (  # noqa: E402
+    CombinedH5MolecularDataset,
+    CombinedSCMDiffusionDataset,
+)
 from morphology_gnn.model.diffusion_model import DiffusionMoleculeModel  # noqa: E402
 from morphology_gnn.model.diffusion_trainer import (  # noqa: E402
     DiffusionMoleculeModule,
@@ -49,6 +52,7 @@ from morphology_gnn.model.diffusion_trainer import (  # noqa: E402
     rdf_hist,
     rdf_mad,
 )
+from morphology_gnn.radius_graph import unwrap_molecule  # noqa: E402
 
 # Reuse the config/CLI/W&B plumbing from run_training.py (same directory, so the
 # import works when running `python runs/run_diffusion.py`).
@@ -56,6 +60,7 @@ from run_training import (  # noqa: E402
     ACT_REGISTRY,
     CONV_REGISTRY,
     OPTIMIZER_REGISTRY,
+    RBF_REGISTRY,
     SCHEDULER_REGISTRY,
     _ensure_wandb_auth,
     _finalize_wandb,
@@ -65,9 +70,12 @@ from run_training import (  # noqa: E402
     build_callbacks,
     build_loaders,
     coerce,
+    configure_cuda,
     deep_merge,
     load_config,
     require_radius,
+    resolve_envelope,
+    resolve_rbf_class,
     set_nested,
     set_seed,
 )
@@ -77,6 +85,10 @@ log = logging.getLogger("morphology_gnn.runs.run_diffusion")
 # --- built-in defaults (lowest precedence) -----------------------------------
 DEFAULT_CONFIG = {
     "data": ["data/2-TNATA_ams.hdf5"],
+    # Dataset layout: "molecular" (per-frame MD *_ams.hdf5 files; the model
+    # generates per-atom positions) or "scm" (SCM-pure boxes; the model then
+    # generates the N molecule center-of-mass positions, ``molecules/position``).
+    "dataset": "molecular",
     # Target property key(s). Required by the dataset loader, but UNUSED by the
     # diffusion model (no property conditioning).
     "target": "Positive VIP",
@@ -142,6 +154,7 @@ DEFAULT_CONFIG = {
 FLAG_DEFS = [
     ("data", "data", dict(nargs="+")),
     ("radius", "radius", dict(type=float)),
+    ("dataset", "dataset", dict(choices=["molecular", "scm"])),
     ("hidden_dim", "model.hidden_dim", dict(type=int)),
     ("num_layers", "model.num_layers", dict(type=int)),
     ("heads", "model.heads", dict(type=int)),
@@ -276,12 +289,35 @@ def build_diffusion_model(
     rbf_kwargs = dict(model_cfg.pop("rbf_kwargs", {}) or {})
     cutoff_lower = model_cfg.pop("cutoff_lower", None)
     cutoff_upper = model_cfg.pop("cutoff_upper", None)
+    cutoff_fn = model_cfg.pop("cutoff_fn", None)
+    cutoff_fn_kwargs = model_cfg.pop("cutoff_fn_kwargs", None)
     if cutoff_upper is None:
         cutoff_upper = rbf_kwargs.get("cutoff_upper", radius)
     if cutoff_upper is not None:
         rbf_kwargs.setdefault("cutoff_upper", cutoff_upper)
     if cutoff_lower is not None:
         rbf_kwargs.setdefault("cutoff_lower", cutoff_lower)
+    # Optional RBF class: `model.rbf_kwargs.rbf_class` may be a name from
+    # RBF_REGISTRY, a class, or an instance; resolve names early so a typo
+    # raises a clear config error instead of failing deep in construction.
+    if "rbf_class" in rbf_kwargs:
+        rbf_kwargs["rbf_class"] = resolve_rbf_class(rbf_kwargs["rbf_class"])
+    # Optional RBF cutoff envelope: first-class `model.cutoff_fn`
+    # (name/class/instance) or an explicit `model.rbf_kwargs.cutoff_fn` deep
+    # override (which wins). Leaving it unset keeps each RBF's own default; an
+    # explicit `rbf_kwargs.cutoff_fn: null` disables the cutoff (multiply by 1).
+    if "cutoff_fn" not in rbf_kwargs and cutoff_fn is not None:
+        rbf_kwargs["cutoff_fn"] = cutoff_fn
+    if "cutoff_fn" in rbf_kwargs:
+        rbf_kwargs["cutoff_fn"] = resolve_envelope(rbf_kwargs["cutoff_fn"])
+    # Envelope constructor kwargs (e.g. PolynomialEnvelope `exponent`): merge
+    # first-class `model.cutoff_fn_kwargs` with deep `rbf_kwargs.cutoff_fn_kwargs`
+    # (deep wins), and let the RBF build the envelope with them.
+    deep_cfk = dict(rbf_kwargs.pop("cutoff_fn_kwargs", {}) or {})
+    merged_cfk = dict(cutoff_fn_kwargs or {})
+    merged_cfk.update(deep_cfk)
+    if merged_cfk:
+        rbf_kwargs["cutoff_fn_kwargs"] = merged_cfk
 
     return DiffusionMoleculeModel(
         conv_class=conv_class,
@@ -322,6 +358,26 @@ def build_diffusion_module(model, config: dict) -> DiffusionMoleculeModule:
     return DiffusionMoleculeModule(model, **kw)
 
 
+def build_dataset(config: dict):
+    """Build the diffusion dataset from the resolved config.
+
+    ``dataset: molecular`` -> per-frame MD files (:class:`CombinedH5MolecularDataset`,
+    per-atom positions). ``dataset: scm`` -> SCM-pure boxes
+    (:class:`CombinedSCMDiffusionDataset`, molecule center-of-mass positions). The
+    target is unused by the diffusion model, so the SCM dataset gets ``None``.
+    """
+    data_files = config["data"]
+    if isinstance(data_files, str):
+        data_files = [data_files]
+    if config.get("dataset") == "scm":
+        return CombinedSCMDiffusionDataset(
+            data_files, target_key=None, radius=config["radius"]
+        )
+    return CombinedH5MolecularDataset(
+        data_files, config["target"], radius=config["radius"]
+    )
+
+
 # --- run name / logger -------------------------------------------------------
 def _make_run_name(config: dict) -> str:
     from datetime import datetime
@@ -332,6 +388,7 @@ def _make_run_name(config: dict) -> str:
     conv = str(model.get("conv_class", "GATConv")).rsplit(".", 1)[-1]
     parts = [
         "diff",
+        "scm" if config.get("dataset") == "scm" else "mol",
         conv,
         f"h{model.get('hidden_dim', 128)}",
         f"l{model.get('num_layers', 2)}",
@@ -388,6 +445,51 @@ def write_xyz(path: str, atom_types: torch.Tensor, pos: torch.Tensor) -> None:
             f.write(f"{int(z):3d} {p[0]:10.4f} {p[1]:10.4f} {p[2]:10.4f}\n")
 
 
+def write_xyz_symbols(path: str, symbols, pos: torch.Tensor) -> None:
+    """Write an XYZ file from element symbols + positions."""
+    pos_np = pos.cpu().numpy()
+    with open(path, "w") as f:
+        f.write(f"{len(symbols)}\nGenerated\n")
+        for s, p in zip(symbols, pos_np):
+            f.write(f"{str(s):>3s} {p[0]:10.4f} {p[1]:10.4f} {p[2]:10.4f}\n")
+
+
+def write_com_xyz(path: str, pos: torch.Tensor) -> None:
+    """Write molecule center-of-mass points as an XYZ file (pseudo-element X)."""
+    write_xyz_symbols(path, ["X"] * int(pos.shape[0]), pos)
+
+
+def reconstruct_box_atoms(box_ref: dict, gen_com: torch.Tensor, box: torch.Tensor):
+    """Place reference molecules at generated COM positions -> ``(symbols, pos)``.
+
+    Each reference molecule's unwrapped conformation (atoms that straddle the
+    periodic boundary pulled back together) is translated so its center of mass
+    lands on the generated COM, then wrapped into the cell. Returns
+    ``(element_symbols, positions)`` for the full reconstructed box, or
+    ``(None, None)`` if the reference COMs are unavailable.
+    """
+    import numpy as np
+
+    ref_com = box_ref.get("com")
+    lattice = box_ref["lattice"]
+    if ref_com is None:
+        return None, None
+    gen_com = gen_com.cpu()
+    ref_com = ref_com.cpu()
+    box = box.cpu()
+    symbols: list[str] = []
+    pos_list: list[torch.Tensor] = []
+    for mi, atoms in enumerate(box_ref["atoms"]):
+        xyz = np.stack([atoms["x"], atoms["y"], atoms["z"]], axis=-1).astype(np.float32)
+        local = unwrap_molecule(torch.tensor(xyz, dtype=torch.float), lattice)
+        shift = gen_com[mi] - ref_com[mi]
+        wrapped = torch.remainder(local + shift, box)
+        for s, p in zip(atoms["symbol"], wrapped.tolist()):
+            symbols.append(s.decode() if isinstance(s, bytes) else str(s))
+            pos_list.append(torch.tensor(p, dtype=torch.float))
+    return symbols, torch.stack(pos_list) if pos_list else None
+
+
 def evaluate_generation(module, loader, sampling_cfg: dict, device):
     """Generate conformations conditioned on a few reference frames.
 
@@ -398,6 +500,15 @@ def evaluate_generation(module, loader, sampling_cfg: dict, device):
     import statistics
 
     ds = loader.dataset
+    # Generation may run over a torch.utils.data.Subset (train/val/test split);
+    # unwrap to the base dataset so per-molecule reference metadata (SCM) is
+    # available for full-box reconstruction.
+    base, subset_indices = ds, None
+    while isinstance(base, torch.utils.data.Subset):
+        subset_indices = base.indices
+        base = base.dataset
+    has_box_ref = hasattr(base, "box_reference")
+
     num_ref = min(int(sampling_cfg.get("num_reference", 4)), len(ds))
     num_samples = int(sampling_cfg.get("num_samples", 8))
     base_seed = sampling_cfg.get("seed", 0)
@@ -423,16 +534,20 @@ def evaluate_generation(module, loader, sampling_cfg: dict, device):
         all_rms += rms
         all_rdf_mad += rdf_mads
         all_min += min_ds
-        refs.append(
-            {
-                "atoms": atoms.cpu(),
-                "cell": cell.cpu(),
-                "truth": truth.cpu(),
-                "gen": gen.cpu(),
-                "truth_hist": truth_hist.cpu(),
-                "edges": edges.cpu(),
-            }
-        )
+        ref = {
+            "atoms": atoms.cpu(),
+            "cell": cell.cpu(),
+            "truth": truth.cpu(),
+            "gen": gen.cpu(),
+            "truth_hist": truth_hist.cpu(),
+            "edges": edges.cpu(),
+        }
+        if has_box_ref:
+            orig_idx = subset_indices[i] if subset_indices is not None else i
+            # `base` is statically a PyG Dataset; box_reference only exists on the
+            # SCM diffusion datasets (guarded by has_box_ref above).
+            ref["box_ref"] = getattr(base, "box_reference")(orig_idx)
+        refs.append(ref)
 
     metrics = {
         "coord_rmse_mean": statistics.mean(all_rms),
@@ -491,7 +606,12 @@ def plot_generation_figures(refs, outdir: str, split: str) -> str:
 
 
 def save_generated_structures(outdir: str, split: str, refs) -> None:
-    """Save generated conformations as npz + a few XYZ files for visualization."""
+    """Save generated conformations as npz + a few XYZ files for visualization.
+
+    For SCM box data (per-molecule reference available) the XYZ files hold the
+    full reconstructed box (reference molecules placed at the generated COMs);
+    otherwise they hold the generated center-of-mass / atomic positions.
+    """
     import numpy as np
 
     for ri, r in enumerate(refs):
@@ -503,8 +623,17 @@ def save_generated_structures(outdir: str, split: str, refs) -> None:
             generated=r["gen"].numpy(),  # (n, N, 3)
         )
     r = refs[0]
+    box_ref = r.get("box_ref")
     for i, g in enumerate(r["gen"][:3]):
-        write_xyz(os.path.join(outdir, f"{split}_sample_{i}.xyz"), r["atoms"], g)
+        path = os.path.join(outdir, f"{split}_sample_{i}.xyz")
+        if box_ref is not None:
+            symbols, pos = reconstruct_box_atoms(box_ref, g, r["cell"])
+            if pos is not None:
+                write_xyz_symbols(path, symbols, pos)
+            else:
+                write_com_xyz(path, g)
+        else:
+            write_xyz(path, r["atoms"], g)
 
 
 # --- main --------------------------------------------------------------------
@@ -519,18 +648,16 @@ def main() -> None:
     log.info("[config] %s", json.dumps(config, indent=2, default=str))
 
     set_seed(config["training"]["seed"])
+    # Enable Tensor Cores (TF32) + silence the "Tensor Cores" warning when
+    # `cuda.tensor_cores` is set.
+    configure_cuda(config)
     outdir = config["logging"]["outdir"]
     os.makedirs(outdir, exist_ok=True)
 
     logger = None
     try:
         # 1. Dataset (positions + cell; the target is unused by the model).
-        data_files = config["data"]
-        if isinstance(data_files, str):
-            data_files = [data_files]
-        dataset = CombinedH5MolecularDataset(
-            data_files, config["target"], radius=config["radius"]
-        )
+        dataset = build_dataset(config)
         total_loader, train_loader, val_loader, test_loader = build_loaders(
             dataset, config["training"]
         )
@@ -543,13 +670,17 @@ def main() -> None:
         )
         module = build_diffusion_module(model, config)
 
-        # 3. Logger + callbacks (early stopping + best checkpoint).
+        # 3. Logger + callbacks (early stopping + best checkpoint). With SCM data
+        #    the val loader may be empty (few boxes); fall back to monitoring the
+        #    training loss in that case.
         run_name = _resolve_run_name(config)
         logger = build_logger(config, run_name=run_name)
+        has_val = len(val_loader) > 0
         callbacks = build_callbacks(
             config,
             os.path.join(outdir, "checkpoints"),
             name_prefix=_fs_safe(run_name),
+            monitor="val_loss" if has_val else "train_loss",
         )
         trainer = pl.Trainer(
             max_epochs=config["training"]["max_epochs"],
@@ -559,13 +690,19 @@ def main() -> None:
             callbacks=callbacks,
             logger=logger,
         )
-        trainer.fit(module, train_loader, val_loader)
-        trainer.test(module, test_loader)
+        trainer.fit(module, train_loader, val_loader if has_val else None)
+        if len(test_loader) > 0:
+            trainer.test(module, test_loader)
 
-        # 4. Generation evaluation on the held-out splits.
+        # 4. Generation evaluation. With SCM data there are only a few boxes per
+        #    dataset, so evaluate generation on every box (total) rather than on
+        #    possibly-empty val/test splits.
         device = next(module.parameters()).device
         gen_metrics = {}
-        for split, loader in [("val", val_loader), ("test", test_loader)]:
+        eval_loaders = [("val", val_loader), ("test", test_loader)]
+        if config.get("dataset") == "scm" or all(len(l) == 0 for _, l in eval_loaders):
+            eval_loaders = [("total", total_loader)]
+        for split, loader in eval_loaders:
             metrics, refs = evaluate_generation(
                 module, loader, config["sampling"], device
             )
@@ -583,9 +720,7 @@ def main() -> None:
 
             _log_config_to_wandb(config)
             _log_yaml_files_to_wandb(config)
-            wandb.log(
-                {k: v for k, v in gen_metrics.items() if not k.endswith("_plot")}
-            )
+            wandb.log({k: v for k, v in gen_metrics.items() if not k.endswith("_plot")})
             for k, v in gen_metrics.items():
                 if k.endswith("_plot"):
                     wandb.log({k: wandb.Image(v)})

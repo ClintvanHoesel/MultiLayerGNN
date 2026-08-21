@@ -3,7 +3,7 @@ import logging
 
 import torch
 
-from .rbf import AbstractRBF, GaussianRBF
+from .rbf import AbstractRBF, GaussianRBF, resolve_rbf_class
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +50,9 @@ class DistanceEmbedding(torch.nn.Module):
     """Embed inter-atomic distance vectors into a dense feature space.
 
     The output size (``num_rbf``) is configurable and handed to an arbitrary RBF
-    class — ``GaussianRBF``, ``ExpNormalSmearing``, or any custom RBF with a
-    matching ``(cutoff_lower, cutoff_upper, num_rbf, ...)`` constructor. This
+    class — ``GaussianRBF``, ``ExpNormalRBF``, ``BesselRBF``, ``ChebychevRBF``,
+    or any custom RBF with a matching
+    ``(cutoff_lower, cutoff_upper, num_rbf, ...)`` constructor. This
     mirrors :class:`AtomTypeEmbedding` (which maps discrete atom types) while
     mapping continuous distances through a radial basis that can optionally be
     trained end-to-end (``trainable=True``).
@@ -72,7 +73,10 @@ class DistanceEmbedding(torch.nn.Module):
         self.embedding_dim = num_rbf
         self.cutoff_lower = cutoff_lower
         self.cutoff_upper = cutoff_upper
-        # `rbf_class` may be a module *class* or an already-built RBF instance.
+        # `rbf_class` may be a registry name (``"ExpNormalRBF"``), a module
+        # *class*, or an already-built RBF instance; strings are resolved through
+        # :func:`resolve_rbf_class` so configs can pick the basis by name.
+        rbf_class = resolve_rbf_class(rbf_class)
         if inspect.isclass(rbf_class):
             self.rbf = rbf_class(
                 cutoff_lower=cutoff_lower,
@@ -158,7 +162,7 @@ class ScalarDistanceEmbedding(torch.nn.Module):
         emb = ScalarDistanceEmbedding()                       # all defaults
         emb = ScalarDistanceEmbedding(num_rbf=64)
         emb = ScalarDistanceEmbedding(
-            rbf_kwargs={"cutoff_upper": 6.0, "rbf_class": ExpNormalSmearing}
+            rbf_kwargs={"cutoff_upper": 6.0, "rbf_class": "ExpNormalRBF"}
         )
     """
 

@@ -27,7 +27,18 @@ model.heads:
 
 model.num_rbf:
   type: categorical
-  choices: [25, 50, 75, 100]
+  choices: [16, 32, 64]
+
+model.rbf_kwargs.rbf_class:
+  type: categorical
+  choices: ["GaussianRBF", "ExpNormalRBF", "BesselRBF", "ChebychevRBF"]
+
+# NOTE: use `null` (not `None`) to disable the cutoff. PyYAML parses bare `None`
+# as the *string* 'None', which would crash the trial (unknown cutoff_fn); `null`
+# becomes Python None and multiplies the RBF features by 1 (no cutoff).
+model.rbf_kwargs.cutoff_fn:
+  type: categorical
+  choices: ["CosineEnvelope", "PolynomialEnvelope", null]
 
 model.dropout:
   type: float
@@ -48,7 +59,7 @@ model.act:
 
 training.lr:
   type: log_float
-  low: 0.00001
+  low: 0.0001
   high: 0.01
 
 training.batch_size:
@@ -71,9 +82,9 @@ radius:
 
 # Optional normalization search space (uncomment to tune). `model.norm` is the
 # first-class knob (applied inside the residual wrapper).
-# model.norm:
-#   type: categorical
-#   choices: ["Identity", "LayerNorm", "BatchNorm", "GraphNorm", "InstanceNorm"]
+model.norm:
+  type: categorical
+  choices: ["Identity", "LayerNorm", "BatchNorm", "GraphNorm", "InstanceNorm"]
 # model.use_residual:
 #   type: categorical
 #   choices: [true, false]

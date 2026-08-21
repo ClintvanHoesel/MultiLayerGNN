@@ -1,9 +1,10 @@
-# Diffusion position-generator configuration.
+# Diffusion position-generator configuration (SCM "morphology" mode).
 #
 # Trains an EGNN-style SE(3)-equivariant denoiser (epsilon-prediction DDPM) on
-# molecular positions: the model learns to denoise a molecule's atomic
-# coordinates inside its periodic cell, conditioned on atom types + cell. At the
-# end of training (or via the saved checkpoint) it can generate new conformations.
+# molecule center-of-mass positions: each sample is one SCM-pure periodic box of
+# N molecules, and the model learns to denoise / generate the N center-of-mass
+# coordinates (molecules/position) conditioned on the molecule species + cell —
+# i.e. the molecular packing of the box.
 #
 # Precedence (lowest to highest):
 #   built-in defaults < this file < CLI flags (--lr 1e-4) < deep overrides
@@ -13,17 +14,31 @@
 #   --diffusion.schedule linear
 #   --sampling.steps 50 --sampling.ddim true
 
-# One or more HDF5 files (same layout, same target key).
-data:
-  - data/2-TNATA_ams.hdf5
+# Dataset layout: "scm" (SCM-pure boxes of molecules, COM positions) or
+# "molecular" (per-frame MD *_ams.hdf5, per-atom positions).
+dataset: scm
 
-# Target property key(s) within each HDF5 group. Required by the dataset loader,
-# but UNUSED by the diffusion model (no property conditioning).
-target: "Positive VIP"
+# One or more SCM-pure HDF5 files (one periodic box per file).
+data:
+  - data/data_SCM_pure/2-TNATA.hdf5
+
+# Target property key(s) within each HDF5 group. UNUSED by the diffusion model
+# (no property conditioning); the SCM diffusion dataset ignores it entirely.
+target: "HOMO"
 
 # Radius-graph cutoff (Angstrom) for the PBC neighbor list. REQUIRED — no
 # default: every run must set it manually (here, or with --radius).
-radius: 4.0
+# NOTE: in SCM mode the graph connects molecule CENTERS, so use a COM-scale
+# cutoff (molecule separation, e.g. 15-25 A), NOT the ~4 A atomic value.
+radius: 20.0
+
+# CUDA / hardware knobs.
+cuda:
+  # Use NVIDIA Tensor Cores for float32 matmuls (TF32) and silence the
+  # "You are using a CUDA device (...) that has Tensor Cores" warning, which
+  # otherwise nags on the first matmul. Trades a little float32 precision for
+  # a large speedup on GPUs with Tensor Cores (RTX 20xx+). CLI: --tensor_cores.
+  tensor_cores: false
 
 model:
   hidden_dim: 128
@@ -35,11 +50,21 @@ model:
   # TransformerConv, ...); it consumes the RBF min-image edge features.
   conv_class: GATConv
   conv_kwargs: {}
-  # Deep kwargs passed to the RBF distance embedding (e.g. {rbf_class:
-  # ExpNormalSmearing}). cutoff_upper defaults to `radius` when omitted.
+  # Deep kwargs passed to the RBF distance embedding, e.g. {rbf_class:
+  # ExpNormalRBF, cutoff_fn: PolynomialEnvelope, cutoff_fn_kwargs: {exponent: 7}}.
+  # cutoff_upper defaults to `radius` when omitted. cutoff_fn_kwargs are extra
+  # constructor kwargs for the envelope (e.g. PolynomialEnvelope `exponent`).
   rbf_kwargs: {}
   cutoff_lower: 0.0
   cutoff_upper: null            # optional -> defaults to `radius`
+  # Optional RBF cutoff envelope (name from ENVELOPE_REGISTRY: CosineEnvelope,
+  # PolynomialEnvelope; or null to keep the RBF's own default).
+  # model.rbf_kwargs.cutoff_fn overrides this; an explicit
+  # rbf_kwargs.cutoff_fn: null disables the cutoff (multiply by 1).
+  cutoff_fn: null
+  # Extra constructor kwargs for the cutoff envelope (e.g. PolynomialEnvelope
+  # `exponent`). model.rbf_kwargs.cutoff_fn_kwargs overrides this.
+  cutoff_fn_kwargs: {}
   # Whether to wrap each conv layer in a Residual connection.
   use_residual: true
   # Normalization type inside the residual wrapper (names from the residual
@@ -61,6 +86,8 @@ training:
   weight_decay: 0.0
   max_epochs: 200
   patience: 30
+  # With only a few SCM boxes per dataset the fractional split can produce empty
+  # val/test loaders (guarded in the runner; generation then runs on all boxes).
   val_frac: 0.1
   test_frac: 0.1
   seed: 0

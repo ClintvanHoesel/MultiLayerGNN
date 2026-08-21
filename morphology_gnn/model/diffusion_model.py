@@ -298,7 +298,8 @@ class DiffusionMoleculeModel(nn.Module):
         dropout: Dropout between conv layers.
         num_rbf: Number of RBF basis functions for the min-image edge distances.
         rbf_kwargs: Deep kwargs for the RBF distance embedding (e.g.
-            ``{"rbf_class": ExpNormalSmearing}``).
+            ``{"rbf_class": "ExpNormalRBF"}``); ``rbf_class`` may be a name
+            from ``RBF_REGISTRY``, a class, or an instance.
         cutoff_lower / cutoff_upper: RBF distance cutoffs (first-class defaults;
             explicit ``rbf_kwargs`` entries win). ``cutoff_upper=None`` keeps
             the distance-embedding default unless the runner defaults it to the

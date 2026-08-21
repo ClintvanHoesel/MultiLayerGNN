@@ -5,7 +5,7 @@ import math
 
 import torch
 
-from .envelope import AbstractEnvelope, CosineEnvelope
+from .envelope import AbstractEnvelope, CosineEnvelope, resolve_envelope
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +24,14 @@ class AbstractRBF(torch.nn.Module, ABC):
     base.
 
     ``cutoff_fn`` is an optional smooth cutoff envelope multiplied into the
-    RBF features — an :class:`AbstractEnvelope` instance, an
+    RBF features — a name from :data:`ENVELOPE_REGISTRY` (e.g.
+    ``"CosineEnvelope"``), an :class:`AbstractEnvelope` instance, an
     ``AbstractEnvelope`` subclass (built with this RBF's cutoffs), or
-    ``None`` for no cutoff (effectively multiplying by ``1``).
+    ``None`` for no cutoff (effectively multiplying by ``1``). When the
+    envelope is given as a name/class, extra constructor kwargs from
+    ``cutoff_fn_kwargs`` (e.g. ``{"exponent": 7}`` for
+    :class:`PolynomialEnvelope`) are passed through; they are ignored when
+    ``cutoff_fn`` is an already-built instance.
     """
 
     def __init__(
@@ -36,7 +41,8 @@ class AbstractRBF(torch.nn.Module, ABC):
         num_rbf: int = 50,
         trainable: bool = False,
         dtype: torch.dtype = torch.float32,
-        cutoff_fn: AbstractEnvelope | type[AbstractEnvelope] | None = None,
+        cutoff_fn: AbstractEnvelope | type[AbstractEnvelope] | str | None = None,
+        cutoff_fn_kwargs: dict | None = None,
     ) -> None:
         super().__init__()
         self.cutoff_lower = cutoff_lower
@@ -44,23 +50,31 @@ class AbstractRBF(torch.nn.Module, ABC):
         self.num_rbf = num_rbf
         self.trainable = trainable
         self.dtype = dtype
+        # Extra constructor kwargs for the envelope (e.g. PolynomialEnvelope's
+        # `exponent`); ignored when `cutoff_fn` is an already-built instance.
+        self.cutoff_fn_kwargs = dict(cutoff_fn_kwargs or {})
         self.cutoff_fn = self._build_cutoff_fn(cutoff_fn)
 
     def _build_cutoff_fn(
-        self, cutoff_fn: AbstractEnvelope | type[AbstractEnvelope] | None
+        self, cutoff_fn: AbstractEnvelope | type[AbstractEnvelope] | str | None
     ) -> AbstractEnvelope | None:
-        """Resolve ``cutoff_fn`` (instance, class, or ``None``) to an envelope."""
-        if cutoff_fn is None:
+        """Resolve ``cutoff_fn`` (name, class, instance, or ``None``) to an envelope.
+
+        A class (or registry name) is built with this RBF's cutoffs plus any
+        extra kwargs from ``self.cutoff_fn_kwargs`` (e.g.
+        ``{"exponent": 7}`` for :class:`PolynomialEnvelope`).
+        """
+        resolved = resolve_envelope(cutoff_fn)
+        if resolved is None:
             return None
-        if isinstance(cutoff_fn, AbstractEnvelope):
-            return cutoff_fn
-        if inspect.isclass(cutoff_fn) and issubclass(cutoff_fn, AbstractEnvelope):
-            return cutoff_fn(
-                cutoff_lower=self.cutoff_lower, cutoff_upper=self.cutoff_upper
-            )
-        raise TypeError(
-            "cutoff_fn must be an AbstractEnvelope instance, an "
-            f"AbstractEnvelope subclass, or None; got {cutoff_fn!r}"
+        if isinstance(resolved, AbstractEnvelope):
+            return resolved
+        # A class is built with this RBF's cutoffs so the envelope and the
+        # basis share the same domain, plus the caller-supplied kwargs.
+        return resolved(
+            cutoff_lower=self.cutoff_lower,
+            cutoff_upper=self.cutoff_upper,
+            **self.cutoff_fn_kwargs,
         )
 
     def _apply_cutoff(self, dist: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
@@ -94,7 +108,8 @@ class GaussianRBF(AbstractRBF):
         num_rbf: int = 50,
         trainable: bool = False,
         dtype: torch.dtype = torch.float32,
-        cutoff_fn: AbstractEnvelope | type[AbstractEnvelope] | None = None,
+        cutoff_fn: AbstractEnvelope | type[AbstractEnvelope] | str | None = None,
+        cutoff_fn_kwargs: dict | None = None,
     ):
         super().__init__(
             cutoff_lower=cutoff_lower,
@@ -103,6 +118,7 @@ class GaussianRBF(AbstractRBF):
             trainable=trainable,
             dtype=dtype,
             cutoff_fn=cutoff_fn,
+            cutoff_fn_kwargs=cutoff_fn_kwargs,
         )
         offset, coeff = self._initial_params()
         if trainable:
@@ -143,7 +159,8 @@ class ExpNormalRBF(AbstractRBF):
         num_rbf: int = 50,
         trainable: bool = False,
         dtype: torch.dtype = torch.float32,
-        cutoff_fn: AbstractEnvelope | type[AbstractEnvelope] | None = CosineEnvelope,
+        cutoff_fn: AbstractEnvelope | type[AbstractEnvelope] | str | None = CosineEnvelope,
+        cutoff_fn_kwargs: dict | None = None,
     ):
         super().__init__(
             cutoff_lower=cutoff_lower,
@@ -152,6 +169,7 @@ class ExpNormalRBF(AbstractRBF):
             trainable=trainable,
             dtype=dtype,
             cutoff_fn=cutoff_fn,
+            cutoff_fn_kwargs=cutoff_fn_kwargs,
         )
 
         means, betas, alpha = self._initial_params()
@@ -210,7 +228,8 @@ class BesselRBF(AbstractRBF):
         num_rbf: int = 50,
         trainable: bool = False,
         dtype: torch.dtype = torch.float32,
-        cutoff_fn: AbstractEnvelope | type[AbstractEnvelope] | None = CosineEnvelope,
+        cutoff_fn: AbstractEnvelope | type[AbstractEnvelope] | str | None = CosineEnvelope,
+        cutoff_fn_kwargs: dict | None = None,
     ):
         super().__init__(
             cutoff_lower=cutoff_lower,
@@ -219,6 +238,7 @@ class BesselRBF(AbstractRBF):
             trainable=trainable,
             dtype=dtype,
             cutoff_fn=cutoff_fn,
+            cutoff_fn_kwargs=cutoff_fn_kwargs,
         )
 
         bessel_weights, prefactor = self._initial_params()
@@ -287,7 +307,8 @@ class ChebychevRBF(AbstractRBF):
         num_rbf: int = 8,
         trainable: bool = False,
         dtype: torch.dtype = torch.float32,
-        cutoff_fn: AbstractEnvelope | type[AbstractEnvelope] | None = CosineEnvelope,
+        cutoff_fn: AbstractEnvelope | type[AbstractEnvelope] | str | None = CosineEnvelope,
+        cutoff_fn_kwargs: dict | None = None,
     ) -> None:
         super().__init__(
             cutoff_lower=cutoff_lower,
@@ -296,6 +317,7 @@ class ChebychevRBF(AbstractRBF):
             trainable=trainable,
             dtype=dtype,
             cutoff_fn=cutoff_fn,
+            cutoff_fn_kwargs=cutoff_fn_kwargs,
         )
         # Orders are non-trainable integer indices into the polynomial family.
         n, prefactor = self._initial_params()
@@ -324,3 +346,52 @@ class ChebychevRBF(AbstractRBF):
             f"{self.__class__.__name__}(cutoff=({self.cutoff_lower}, {self.cutoff_upper}), "
             f"num_rbf={self.num_rbf}, trainable={self.trainable})"
         )
+
+
+# --- registry: resolve config names to RBF classes ----------------------------
+# Canonical names for the built-in radial basis functions. A string used as
+# ``rbf_class`` (in ``rbf_kwargs`` or straight to :class:`DistanceEmbedding`) is
+# resolved through this registry, so any RBF can be picked from a config file::
+#
+#     model.rbf_kwargs.rbf_class: ExpNormalRBF
+#
+# ``ExpNormalSmearing`` is kept as an alias for :class:`ExpNormalRBF` (its
+# torchmd-net upstream name), so old configs/commands keep working.
+RBF_REGISTRY: dict[str, type[AbstractRBF]] = {
+    "GaussianRBF": GaussianRBF,
+    "ExpNormalRBF": ExpNormalRBF,
+    "ExpNormalSmearing": ExpNormalRBF,
+    "BesselRBF": BesselRBF,
+    "ChebychevRBF": ChebychevRBF,
+}
+
+
+def resolve_rbf_class(
+    spec: str | type[AbstractRBF] | AbstractRBF,
+) -> type[AbstractRBF] | AbstractRBF:
+    """Resolve an ``rbf_class`` spec to an RBF class or instance.
+
+    Accepts a registry name (``"ExpNormalRBF"``), an ``AbstractRBF`` subclass,
+    or an already-built RBF instance (returned unchanged). Anything else raises
+    ``ValueError``/``TypeError`` naming the valid choices, so a typo in a config
+    surfaces a clear message instead of an obscure failure deep in construction.
+    """
+    if isinstance(spec, str):
+        cls = RBF_REGISTRY.get(spec)
+        if cls is None:
+            raise ValueError(
+                f"unknown RBF class {spec!r}; choose from {sorted(RBF_REGISTRY)}"
+            )
+        return cls
+    if inspect.isclass(spec):
+        if not issubclass(spec, AbstractRBF):
+            raise TypeError(
+                f"rbf_class must be an AbstractRBF subclass/instance; got {spec!r}"
+            )
+        return spec
+    if isinstance(spec, AbstractRBF):
+        return spec
+    raise TypeError(
+        "rbf_class must be a name (str), AbstractRBF subclass, or instance; "
+        f"got {spec!r}"
+    )

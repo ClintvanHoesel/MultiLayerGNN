@@ -1,3 +1,4 @@
+import inspect
 import logging
 import math
 from abc import ABC, abstractmethod
@@ -102,3 +103,51 @@ class CosineEnvelope(AbstractEnvelope):
             # remove contributions beyond the cutoff radius
             cutoffs = cutoffs * (distances < self.cutoff_upper)
             return cutoffs
+
+
+ENVELOPE_REGISTRY = {
+    "CosineEnvelope": CosineEnvelope,
+    "PolynomialEnvelope": PolynomialEnvelope,
+}
+
+
+def resolve_envelope(
+    spec: str | type[AbstractEnvelope] | AbstractEnvelope | None,
+) -> type[AbstractEnvelope] | AbstractEnvelope | None:
+    """Resolve a ``cutoff_fn`` spec to an envelope class, instance, or ``None``.
+
+    Accepts a registry name (``"CosineEnvelope"``), an ``AbstractEnvelope``
+    subclass, or an already-built envelope instance (returned unchanged).
+    ``None`` (and the strings ``"None"``/``"null"``, which PyYAML may leave as
+    strings) stays ``None`` — no cutoff, so the RBF features are multiplied by
+    1. Anything else raises ``ValueError``/``TypeError`` naming the valid
+    choices, so a typo in a config surfaces a clear message instead of an
+    obscure failure deep in construction.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, AbstractEnvelope):
+        return spec
+    if inspect.isclass(spec):
+        if not issubclass(spec, AbstractEnvelope):
+            raise TypeError(
+                f"cutoff_fn must be an AbstractEnvelope subclass/instance; got {spec!r}"
+            )
+        return spec
+    if isinstance(spec, str):
+        # Bare `None` in a YAML file is parsed by PyYAML as the string "None"
+        # (only `null` becomes Python None); treat it as "no cutoff" so HPO
+        # search spaces can disable the envelope without crashing.
+        if spec.strip().lower() in ("none", "null"):
+            return None
+        cls = ENVELOPE_REGISTRY.get(spec)
+        if cls is None:
+            raise ValueError(
+                f"unknown cutoff_fn {spec!r}; choose from {sorted(ENVELOPE_REGISTRY)} "
+                "or null (no cutoff)"
+            )
+        return cls
+    raise TypeError(
+        "cutoff_fn must be a name (str), AbstractEnvelope subclass, instance, "
+        f"or None; got {spec!r}"
+    )

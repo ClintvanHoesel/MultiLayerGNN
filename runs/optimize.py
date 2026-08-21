@@ -67,6 +67,7 @@ from run_training import (  # noqa: E402  (sys.path fix above)
     build_model,
     build_module,
     compute_metrics,
+    configure_cuda,
     deep_merge,
     fit_target_scaler,
     load_config,
@@ -89,6 +90,14 @@ _DEFAULT_SEARCH_SPACE = {
     "model.num_layers": {"type": "int", "low": 1, "high": 4},
     # "model.heads": {"type": "categorical", "choices": [1, 2, 4, 8]},
     # "model.num_rbf": {"type": "categorical", "choices": [25, 50, 75, 100]},
+    # "model.rbf_kwargs.rbf_class": {
+    #     "type": "categorical",
+    #     "choices": ["GaussianRBF", "ExpNormalRBF", "BesselRBF", "ChebychevRBF"],
+    # },
+    # "model.rbf_kwargs.cutoff_fn": {
+    #     "type": "categorical",
+    #     "choices": ["CosineEnvelope", "PolynomialEnvelope"],
+    # },
     # "model.dropout": {"type": "float", "low": 0.0, "high": 0.5},
     # "model.act": {
     #     "type": "categorical",
@@ -258,6 +267,9 @@ def _make_objective(base_config, search_space, args, study_name):
         seed = (base_seed + trial.number) % (2**31)
         set_seed(seed)
         trial_config["training"]["seed"] = seed
+        # Enable Tensor Cores (TF32) + silence the "Tensor Cores" warning when
+        # `cuda.tensor_cores` is set (search space may tune the flag per trial).
+        configure_cuda(trial_config)
 
         # Cap the trial budget so HPO stays fast; early stopping ends it sooner.
         trial_config["training"]["max_epochs"] = args.max_epochs
@@ -363,10 +375,10 @@ def parse_args(argv=None):
         "--timeout", type=float, default=None, help="Stop after N seconds (optional)."
     )
     parser.add_argument(
-        "--max-epochs", type=int, default=60, help="Per-trial epoch cap."
+        "--max-epochs", type=int, default=300, help="Per-trial epoch cap."
     )
     parser.add_argument(
-        "--patience", type=int, default=15, help="Early-stopping patience per trial."
+        "--patience", type=int, default=30, help="Early-stopping patience per trial."
     )
     parser.add_argument(
         "--objective",
@@ -471,6 +483,9 @@ def main() -> None:
         log_file=base_config["logging"].get("log_file"),
     )
     set_seed(base_config["training"]["seed"])
+    # Enable Tensor Cores (TF32) + silence the "Tensor Cores" warning when
+    # `cuda.tensor_cores` is set.
+    configure_cuda(base_config)
 
     outdir = args.outdir or base_config["logging"]["outdir"]
     hpo_dir = os.path.join(outdir, "hpo")

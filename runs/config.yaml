@@ -11,7 +11,7 @@
 
 # One or more HDF5 files (same layout, same target key).
 data:
-  - data/BCP.hdf5
+  - data/data_Daniel/BCP.hdf5
 
 # Target property key(s) within each HDF5 group. Use a single string for one
 # property, or a list to train on several at once (the model outputs one value
@@ -22,14 +22,22 @@ target: "HOMO"
 # Radius-graph cutoff (Angstrom). REQUIRED — no default: every run must set it
 # manually (here, or with --radius). This is the cutoff for building edges
 # between atoms (radius_graph / radius_graph_pbc).
-radius: 3.0
+radius: 4.5
+
+# CUDA / hardware knobs.
+cuda:
+  # Use NVIDIA Tensor Cores for float32 matmuls (TF32) and silence the
+  # "You are using a CUDA device (...) that has Tensor Cores" warning, which
+  # otherwise nags on the first matmul. Trades a little float32 precision for
+  # a large speedup on GPUs with Tensor Cores (RTX 20xx+). CLI: --tensor_cores.
+  tensor_cores: true
 
 model:
-  hidden_dim: 256
-  num_layers: 2
+  hidden_dim: 64
+  num_layers: 6
   # Attention heads (only used when conv_class is GATConv).
-  heads: 5
-  num_rbf: 50
+  heads: 4
+  num_rbf: 32
   # Use geometric edge features (bond distances via RBF). For a single molecule
   # with near-identical frames, plain mean-pooled atom embeddings are almost the
   # same across samples, so the model cannot even overfit; edge distances are
@@ -41,15 +49,29 @@ model:
   # Deep kwargs passed to AtomTypeEmbedding (e.g. padding_idx).
   atom_emb_kwargs: {}
   # Deep kwargs passed to the RBF distance embedding (DistanceEmbedding): any of
-  # cutoff_lower / cutoff_upper / num_rbf / rbf_class / trainable, e.g.
-  # {cutoff_upper: 5.0, rbf_class: ExpNormalSmearing}. Explicit cutoff keys here
-  # take precedence over the first-class cutoff_lower / cutoff_upper below.
+  # cutoff_lower / cutoff_upper / num_rbf / rbf_class / cutoff_fn / trainable /
+  # cutoff_fn_kwargs, e.g. {cutoff_upper: 5.0, rbf_class: ExpNormalRBF,
+  #       cutoff_fn: PolynomialEnvelope, cutoff_fn_kwargs: {exponent: 7}}.
+  # rbf_class selects the radial basis — a name from RBF_REGISTRY (GaussianRBF,
+  # ExpNormalRBF, BesselRBF, ChebychevRBF; ExpNormalSmearing aliases
+  # ExpNormalRBF) or a class/instance. cutoff_fn_kwargs are extra constructor
+  # kwargs for the envelope (e.g. PolynomialEnvelope `exponent`). Explicit
+  # cutoff keys here take precedence over the first-class cutoff_lower /
+  # cutoff_upper / cutoff_fn / cutoff_fn_kwargs below.
   rbf_kwargs: {}
   # First-class RBF distance-embedding cutoffs (used when use_edge_features is
   # true). cutoff_upper is optional — when omitted (null) it defaults to the
   # radius-graph cutoff (`radius`). cutoff_lower defaults to 0.0.
   cutoff_lower: 0.0
   cutoff_upper: null            # optional -> defaults to `radius`
+  # Optional RBF cutoff envelope (name from ENVELOPE_REGISTRY: CosineEnvelope,
+  # PolynomialEnvelope; or null to keep the RBF's own default).
+  # model.rbf_kwargs.cutoff_fn overrides this; an explicit
+  # rbf_kwargs.cutoff_fn: null disables the cutoff (multiply by 1).
+  cutoff_fn: null
+  # Extra constructor kwargs for the cutoff envelope (e.g. PolynomialEnvelope
+  # `exponent`). model.rbf_kwargs.cutoff_fn_kwargs overrides this.
+  cutoff_fn_kwargs: {}
   # Whether to wrap each conv layer in a Residual connection.
   use_residual: true
   # Normalization type applied inside the residual wrapper (first-class knob).
@@ -57,7 +79,7 @@ model:
   # GraphNorm, InstanceNorm. Extra kwargs for the chosen class go in norm_kwargs
   # (e.g. {track_running_stats: false} for BatchNorm). Takes effect only when
   # use_residual is true; residual_kwargs.norm overrides this.
-  norm: graphnorm
+  norm: LayerNorm
   norm_kwargs: {}
   # Number of output values per graph (one per target property). Set
   # automatically from the number of `target` properties; override only for
@@ -65,28 +87,28 @@ model:
   # num_targets: 1
   # Options passed to the Residual wrapper (dropout, pre/post norm placement).
   residual_kwargs:
-    dropout: 0.
+    # dropout: null
     pre_norm: true
     post_norm: false
-  # Optional: activation name ("gelu", "mish", "relu", "silu", "tanh").
-  # act: gelu
+  dropout: 0.05
+  act: gelu
   # Optional: node->graph aggregation. A single name ("MeanAggregation",
   # "SumAggregation", "MaxAggregation"), several combined — either a YAML list
   # or a "MeanAggregation+MaxAggregation" string (joined with MultiAggregation,
   # which concatenates their outputs) — or any other torch_geometric.nn.aggr
   # name (imported on demand, e.g. "AttentionalAggregation", "SoftmaxAggregation").
-  # global_aggr: MeanAggregation
+  global_aggr: MeanAggregation+MaxAggregation+VariancePreservingAggregation+StdAggregation
 
 training:
-  batch_size: 16
+  batch_size: 64
   lr: 0.001
-  weight_decay: 0.0
-  max_epochs: 1000
-  patience: 100
+  weight_decay: 0.00001
+  max_epochs: 300
+  patience: 50
   val_frac: 0.1
   test_frac: 0.1
   seed: 0
-  num_workers: 4
+  num_workers: 0
   accelerator: auto
   # Optimizer / scheduler names from the runner registries.
   optimizer_class: AdamW
@@ -118,10 +140,10 @@ logging:
   # Set to a W&B project name to enable W&B logging. When enabled, the run gets
   # a human-friendly auto-generated name from the hyperparameters (see
   # run_training._make_run_name); override it with `run_name` below.
-  wandb_project: ScalarGNNAmsData
+  wandb_project: BCP_HOMO_HyperOpt
   # Optional W&B niceties:
   run_name: null             # e.g. "gat-h256-l4-r6.0" (auto if null)
-  group: 2TNATA_hyperopt                # group related runs together in the W&B UI
+  group: BCP_HOMO                       # group related runs together in the W&B UI
   tags: null                 # e.g. [baseline, gat]  (list)
   notes: null                # free-text description shown on the run page
   # Stdlib logging for the library + CLI (morphology_gnn._logging.configure_logging).

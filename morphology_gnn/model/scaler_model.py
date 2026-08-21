@@ -185,8 +185,14 @@ class ScalarMoleculeModel(torch.nn.Module):
             residual_kwargs.setdefault("norm", norm)
         if norm_kwargs:
             residual_kwargs.setdefault("norm_kwargs", dict(norm_kwargs))
-        if not use_residual and (norm is not None or "norm" in residual_kwargs):
-            logger.warning("norm/norm_kwargs are ignored because use_residual=False")
+        if dropout is not None:
+            residual_kwargs.setdefault("dropout", dropout)
+        if not use_residual and (
+            norm is not None or dropout is not None or "norm" in residual_kwargs
+        ):
+            logger.warning(
+                "norm/norm_kwargs/dropout are ignored because use_residual=False"
+            )
         self._resolve_norm(residual_kwargs, hidden_dim)
         self.residual_kwargs = residual_kwargs
         logger.debug(

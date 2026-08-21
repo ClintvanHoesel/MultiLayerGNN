@@ -382,5 +382,4 @@ class PeriodicTable:
         return cls.data[cls._as_index(arg)][prop]
 
 
-# Convenience alias, mirroring the historical ``PT`` name.
 PT = PeriodicTable
