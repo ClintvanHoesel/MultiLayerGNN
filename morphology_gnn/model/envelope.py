@@ -1,14 +1,38 @@
 import logging
 import math
+from abc import ABC, abstractmethod
 
 import torch
 
 logger = logging.getLogger(__name__)
 
 
+class AbstractEnvelope(torch.nn.Module, ABC):
+    """Abstract base class for smooth cutoff envelope functions.
+
+    Use this as the typing anchor for any envelope module — e.g.
+    ``envelope: AbstractEnvelope`` or ``envelope_class: type[AbstractEnvelope]``
+    — and for ``isinstance`` checks over concrete implementations such as
+    :class:`PolynomialEnvelope` and :class:`CosineEnvelope`.
+
+    Subclasses must implement :meth:`forward`; the shared
+    ``(cutoff_lower, cutoff_upper)`` constructor arguments are stored on the
+    base.
+    """
+
+    def __init__(self, cutoff_lower: float = 0.0, cutoff_upper: float = 5.0) -> None:
+        super().__init__()
+        self.cutoff_lower = float(cutoff_lower)
+        self.cutoff_upper = float(cutoff_upper)
+
+    @abstractmethod
+    def forward(self, distances: torch.Tensor) -> torch.Tensor:
+        """Return a smooth cutoff mask in ``[0, 1]`` for the input distances."""
+
+
 # https://github.com/atomicarchitects/equiformer_v3/blob/main/experimental/models/equiformer_v3/envelope.py
 # https://github.com/gasteigerjo/dimenet/blob/master/dimenet/model/layers/envelope.py
-class PolynomialEnvelope(torch.nn.Module):
+class PolynomialEnvelope(AbstractEnvelope):
     """
     1.  Polynomial envelope function that ensures a smooth cutoff.
     2.  Reference: https://github.com/facebookresearch/fairchem/blob/518d0ea12110548bd5ffaf9a43060b8eae152e13/src/fairchem/core/models/esen/nn/radial.py#L22
@@ -17,10 +41,11 @@ class PolynomialEnvelope(torch.nn.Module):
     def __init__(
         self, cutoff_lower: float = 0.0, cutoff_upper: float = 5.0, exponent: int = 5
     ) -> None:
-        super().__init__()
         assert exponent > 0
-        self.cutoff_lower = float(cutoff_lower)
-        self.cutoff_upper = float(cutoff_upper)
+        super().__init__(
+            cutoff_lower=cutoff_lower,
+            cutoff_upper=cutoff_upper,
+        )
         self.cutoff_diff = self.cutoff_upper - self.cutoff_lower
         self.exponent = exponent
         self.p: float = float(exponent)
@@ -46,12 +71,13 @@ class PolynomialEnvelope(torch.nn.Module):
         return "cutoff={}, exponent={}".format(self.cutoff, self.exponent)
 
 
-class CosineEnvelope(torch.nn.Module):
+class CosineEnvelope(AbstractEnvelope):
 
-    def __init__(self, cutoff_lower: float = 0.0, cutoff_upper: float = 5.0):
-        super(CosineEnvelope, self).__init__()
-        self.cutoff_lower = float(cutoff_lower)
-        self.cutoff_upper = float(cutoff_upper)
+    def __init__(self, cutoff_lower: float = 0.0, cutoff_upper: float = 5.0) -> None:
+        super().__init__(
+            cutoff_lower=cutoff_lower,
+            cutoff_upper=cutoff_upper,
+        )
 
     def forward(self, distances: torch.Tensor) -> torch.Tensor:
         if self.cutoff_lower > 0:
