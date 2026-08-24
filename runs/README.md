@@ -98,10 +98,10 @@ The strategy is chosen automatically from the data:
 
 Each fold trains a fresh model, and its held-out fold is used for early stopping
 and evaluation. Per fold, the run saves a best checkpoint
-(`<outdir>/cv/<fold>/checkpoints`), a truth-vs-pred plot
-(`<outdir>/cv/<fold>/truth_vs_pred.png`) and the per-fold metrics; the fold
-metrics are then aggregated (**mean ± std**) and written to
-`<outdir>/cv/cv_summary.csv`. With `--wandb-project`, one W&B run (name suffixed
+(`<outdir>/<run>/cv/<fold>/checkpoints`), a truth-vs-pred plot
+(`<outdir>/<run>/cv/<fold>/truth_vs_pred.png`) and the per-fold metrics; the
+fold metrics are then aggregated (**mean ± std**) and written to
+`<outdir>/<run>/cv/cv_summary.csv`. With `--wandb-project`, one W&B run (name suffixed
 `-cv-group-k5` / `-cv-repeated-k5x3`) logs every fold's metrics + plot, a table
 of all folds, and the aggregate `cv/<metric>_mean` / `cv/<metric>_std` (plus
 per-target values), with the full resolved config attached under Overview →
@@ -145,6 +145,12 @@ Use `--wandb-project <name>` (or `logging.wandb_project`) to log to Weights &
 Biases (requires `WANDB_API_KEY` in the environment). Without it, a `CSVLogger`
 is used and artifacts (checkpoints, `truth_vs_pred.png`, csv logs) land in
 `logging.outdir` (`runs/artifacts/` by default).
+
+**Per-run folders:** every run writes all of its artifacts (checkpoints, csv
+logs, `truth_vs_pred.png`, CV results) into its own subfolder
+`logging.outdir/<run name>/`, where `<run name>` is the auto-generated unique
+name (see below) or your explicit `--run_name`. Runs therefore never overwrite
+or mix each other's figures, CSVs or models.
 
 ### W&B run naming + clean finish
 
@@ -217,8 +223,8 @@ stochasticity), `num_samples` (structures per reference frame),
 
 With SCM data (few boxes per dataset) the validation/test splits can be empty;
 the runner detects this, falls back to monitoring `train_loss`, and evaluates
-generation on the full dataset. Artifacts land in `logging.outdir`
-(`runs/artifacts_diffusion/` by default): best checkpoint,
+generation on the full dataset. Artifacts land in `logging.outdir/<run name>/`
+(`runs/artifacts_diffusion/` by default, one folder per run): best checkpoint,
 `generation_<split>.png` (truth vs generated RDF + RMSD/min-pair histograms),
 `*_generated.npz` (generated structures) and XYZ files for visualization
 (`<split>_sample_<i>.xyz` — for SCM data these are the full reconstructed

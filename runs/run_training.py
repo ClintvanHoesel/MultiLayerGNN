@@ -19,7 +19,15 @@ passing the dotted config path::
         --training.optimizer_kwargs.betas "[0.9, 0.999]" \\
         --training.scheduler_class ReduceLROnPlateau \\
         --logging.wandb_project InitialGNNtrial
-"""
+    SCM-pure molecular files (``data/data_SCM_pure/``) train with
+    ``--dataset scm`` (config ``dataset: scm``). The graph connects each
+    molecule's atoms, so keep ``--radius`` at an atomic scale (~4.5-6 A, NOT the
+    COM-scale used by the diffusion runner), and use short-name scalar targets
+    (``HOMO``, ``S1``, ...) which are resolved automatically::
+
+        python runs/run_training.py --dataset scm \
+            --data data/data_SCM_pure/2-TNATA.hdf5 --target HOMO \
+            --radius 4.5 --max_epochs 100"""
 
 from __future__ import annotations
 
@@ -39,8 +47,6 @@ import lightning.pytorch as pl
 from morphology_gnn._logging import configure_logging  # noqa: E402
 
 configure_logging(level=os.environ.get("MGN_LOG_LEVEL"))
-
-from morphology_gnn.data import CombinedH5MolecularDataset  # noqa: E402
 
 # Shared building blocks (registries, config/default plumbing, model builders,
 # data + plotting helpers, cross-validation and W&B utilities) now live in
@@ -69,6 +75,7 @@ from training_helpers import (  # noqa: E402
     resolve_envelope,
     _run_cross_validation,
     build_callbacks,
+    build_dataset,
     build_loaders,
     build_loaders_from_indices,
     build_logger,
@@ -80,10 +87,13 @@ from training_helpers import (  # noqa: E402
     deep_merge,
     fit_target_scaler,
     get_nested,
+    gradient_clip_kwargs,
     load_config,
     normalize_targets,
     predict,
     resolve_rbf_class,
+    resolve_run_outdir,
+    restore_best_checkpoint,
     sanitize_name,
     save_truth_vs_pred_figure,
     set_nested,
@@ -213,18 +223,17 @@ def main() -> None:
     # Enable Tensor Cores (TF32) + silence the "Tensor Cores" warning when
     # `cuda.tensor_cores` is set.
     configure_cuda(config)
-    outdir = config["logging"]["outdir"]
-    os.makedirs(outdir, exist_ok=True)
+    # Give every run its own folder (<base outdir>/<run name>) so figures,
+    # CSVs, checkpoints and CV results from different runs never mix. The
+    # resolved run name is fixed into the config here, so the folder name, the
+    # W&B run name and the checkpoint filename prefixes all agree exactly.
+    outdir = resolve_run_outdir(config)
 
     logger = None
     try:
-        # 1. Dataset (one or several HDF5 files).
-        data_files = config["data"]
-        if isinstance(data_files, str):
-            data_files = [data_files]
-        dataset = CombinedH5MolecularDataset(
-            data_files, targets, radius=config["radius"]
-        )
+        # 1. Dataset (one or several HDF5 files; molecular or SCM-pure layout
+        #    selected by `dataset` / --dataset — see build_dataset()).
+        dataset = build_dataset(config)
 
         # Cross-validation mode (k_folds > 1) replaces the single split below.
         if config["training"].get("k_folds") and config["training"]["k_folds"] > 1:
@@ -258,8 +267,9 @@ def main() -> None:
             config=config,
         )
 
-        # 3. Logger + callbacks. Checkpoint filenames carry the (W&B) run name.
-        run_name = _resolve_run_name(config)
+        # 3. Logger + callbacks. Checkpoint filenames carry the (W&B) run name
+        #    (fixed by resolve_run_outdir, so it matches the per-run folder).
+        run_name = config["logging"]["run_name"]
         logger = build_logger(config, run_name=run_name)
         callbacks = build_callbacks(
             config,
@@ -271,10 +281,15 @@ def main() -> None:
             accelerator=config["training"]["accelerator"],
             devices=1,
             log_every_n_steps=10,
+            **gradient_clip_kwargs(config["training"]),
             callbacks=callbacks,
             logger=logger,
         )
         trainer.fit(system, train_loader, val_loader)
+
+        # After fit the in-memory module holds the last-epoch weights; final
+        # metrics and the truth-vs-predicted figure must use the BEST checkpoint.
+        restore_best_checkpoint(system, trainer)
 
         # 4. Final truth-vs-predicted figure for total / train / validation / test.
         predictions, final_metrics = [], {}
@@ -284,14 +299,15 @@ def main() -> None:
             ("Validation", val_loader),
             ("Test", test_loader),
         ]:
-            truth, pred = predict(system, loader)
-            metrics = compute_metrics(truth, pred, targets)
+            truth, pred, groups = predict(system, loader)
+            metrics = compute_metrics(truth, pred, targets, groups=groups)
             log.info(
-                "%10s: MAE=%.4f  RMSE=%.4f  R2=%.4f  n=%d",
+                "%10s: MAE=%.4f  RMSE=%.4f  R2(within-group)=%.4f  R2(pooled)=%.4f  n=%d",
                 name,
                 metrics["mae"],
                 metrics["rmse"],
                 metrics["r2"],
+                metrics["r2_pooled"],
                 truth.numel(),
             )
             for i, tk in enumerate(targets):
@@ -302,16 +318,34 @@ def main() -> None:
                     metrics[f"target_{i}_rmse"],
                     metrics[f"target_{i}_r2"],
                 )
+            # Per-material (per-group) R2 breakdown — the honest number when a
+            # split mixes materials with different target means.
+            by_group = metrics.get("r2_by_group") or {}
+            if len(by_group) <= 12:
+                log.info(
+                    "    per-group R2: %s",
+                    {k: f"{v:.4f}" for k, v in by_group.items()},
+                )
+            elif by_group:
+                log.info(
+                    "    per-group R2 over %d groups (weighted mean %.4f)",
+                    len(by_group),
+                    metrics["r2"],
+                )
             predictions.append((name, truth.view(-1), pred.view(-1)))
             prefix = name.lower()
             for metric in ("mae", "rmse", "r2"):
                 final_metrics[f"{prefix}_{metric}"] = metrics[metric]
+            final_metrics[f"{prefix}_r2_pooled"] = metrics["r2_pooled"]
             for i, tk in enumerate(targets):
                 tag = sanitize_name(tk)
                 for metric in ("mae", "rmse", "r2"):
                     final_metrics[f"{prefix}_{tag}_{metric}"] = metrics[
                         f"target_{i}_{metric}"
                     ]
+                final_metrics[f"{prefix}_{tag}_r2_pooled"] = metrics[
+                    f"target_{i}_r2_pooled"
+                ]
 
         plot_path = os.path.join(outdir, "truth_vs_pred.png")
         save_truth_vs_pred_figure(predictions, plot_path)

@@ -70,12 +70,14 @@ from run_training import (  # noqa: E402
     build_callbacks,
     build_loaders,
     coerce,
+    gradient_clip_kwargs,
     configure_cuda,
     deep_merge,
     load_config,
     require_radius,
     resolve_envelope,
     resolve_rbf_class,
+    resolve_run_outdir,
     set_nested,
     set_seed,
 )
@@ -129,6 +131,11 @@ DEFAULT_CONFIG = {
         "scheduler_kwargs": {},
         "scheduler_monitor": "val_loss",
         "scheduler_interval": "epoch",
+        # Gradient clipping (PyTorch Lightning Trainer kwargs): maximum allowed
+        # gradient norm/value. 0 or None disables clipping. algorithm: "norm"
+        # (default, global-norm clip) or "value" (per-param clip).
+        "gradient_clip_val": None,
+        "gradient_clip_algorithm": "norm",
     },
     "sampling": {
         "steps": 100,
@@ -172,6 +179,12 @@ FLAG_DEFS = [
     ("seed", "training.seed", dict(type=int)),
     ("num_workers", "training.num_workers", dict(type=int)),
     ("accelerator", "training.accelerator", {}),
+    ("gradient_clip_val", "training.gradient_clip_val", dict(type=float)),
+    (
+        "gradient_clip_algorithm",
+        "training.gradient_clip_algorithm",
+        dict(choices=["norm", "value"]),
+    ),
     ("sampling_steps", "sampling.steps", dict(type=int)),
     ("sampling_ddim", "sampling.ddim", dict(action="store_true", default=None)),
     ("sampling_eta", "sampling.eta", dict(type=float)),
@@ -651,8 +664,12 @@ def main() -> None:
     # Enable Tensor Cores (TF32) + silence the "Tensor Cores" warning when
     # `cuda.tensor_cores` is set.
     configure_cuda(config)
-    outdir = config["logging"]["outdir"]
-    os.makedirs(outdir, exist_ok=True)
+    # Give every run its own folder (<base outdir>/<run name>) so figures,
+    # CSVs, checkpoints and generated structures from different runs never mix.
+    # The resolved run name is fixed into the config here, so the folder name,
+    # the W&B run name and the checkpoint filename prefixes all agree exactly
+    # (resolved with the diffusion-specific run-name generator below).
+    outdir = resolve_run_outdir(config, run_name=_resolve_run_name(config))
 
     logger = None
     try:
@@ -673,7 +690,8 @@ def main() -> None:
         # 3. Logger + callbacks (early stopping + best checkpoint). With SCM data
         #    the val loader may be empty (few boxes); fall back to monitoring the
         #    training loss in that case.
-        run_name = _resolve_run_name(config)
+        # Run name fixed by resolve_run_outdir, so it matches the per-run folder.
+        run_name = config["logging"]["run_name"]
         logger = build_logger(config, run_name=run_name)
         has_val = len(val_loader) > 0
         callbacks = build_callbacks(
@@ -687,6 +705,7 @@ def main() -> None:
             accelerator=config["training"]["accelerator"],
             devices=1,
             log_every_n_steps=10,
+            **gradient_clip_kwargs(config["training"]),
             callbacks=callbacks,
             logger=logger,
         )

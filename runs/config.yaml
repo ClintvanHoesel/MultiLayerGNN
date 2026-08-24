@@ -9,6 +9,17 @@
 #   --training.optimizer_kwargs.betas "[0.9, 0.999]"
 #   --training.scheduler_class ReduceLROnPlateau
 
+# Dataset layout: "molecular" (default) or "scm".
+#   molecular — per-frame MD *_ams.hdf5 files (e.g. data/data_Daniel/); nodes
+#               are the atoms of each frame.
+#   scm       — SCM-pure per-molecule files (data/data_SCM_pure/); nodes are the
+#               atoms of one molecule, targets use short names (HOMO, S1, ...).
+# To train on SCM-pure data: point `data:` at those files, set `dataset: scm`,
+# keep `radius` at an ATOMIC scale (~4.5-6 A — NOT the COM-scale used by the
+# diffusion runner), and pick a scalar target (HOMO, HOMO-1, LUMO, LUMO+1, EA,
+# IP, S1, T1). CLI: --dataset scm
+dataset: molecular
+
 # One or more HDF5 files (same layout, same target key).
 data:
   - data/data_Daniel/BCP.hdf5
@@ -22,7 +33,7 @@ target: "HOMO"
 # Radius-graph cutoff (Angstrom). REQUIRED — no default: every run must set it
 # manually (here, or with --radius). This is the cutoff for building edges
 # between atoms (radius_graph / radius_graph_pbc).
-radius: 4.5
+radius: 5
 
 # CUDA / hardware knobs.
 cuda:
@@ -33,11 +44,11 @@ cuda:
   tensor_cores: true
 
 model:
-  hidden_dim: 64
-  num_layers: 6
+  hidden_dim: 512
+  num_layers: 8
   # Attention heads (only used when conv_class is GATConv).
   heads: 4
-  num_rbf: 32
+  num_rbf: 64
   # Use geometric edge features (bond distances via RBF). For a single molecule
   # with near-identical frames, plain mean-pooled atom embeddings are almost the
   # same across samples, so the model cannot even overfit; edge distances are
@@ -58,7 +69,7 @@ model:
   # kwargs for the envelope (e.g. PolynomialEnvelope `exponent`). Explicit
   # cutoff keys here take precedence over the first-class cutoff_lower /
   # cutoff_upper / cutoff_fn / cutoff_fn_kwargs below.
-  rbf_kwargs: {}
+  rbf_kwargs: {rbf_class: GaussianRBF}
   # First-class RBF distance-embedding cutoffs (used when use_edge_features is
   # true). cutoff_upper is optional — when omitted (null) it defaults to the
   # radius-graph cutoff (`radius`). cutoff_lower defaults to 0.0.
@@ -79,7 +90,7 @@ model:
   # GraphNorm, InstanceNorm. Extra kwargs for the chosen class go in norm_kwargs
   # (e.g. {track_running_stats: false} for BatchNorm). Takes effect only when
   # use_residual is true; residual_kwargs.norm overrides this.
-  norm: LayerNorm
+  norm: GraphNorm
   norm_kwargs: {}
   # Number of output values per graph (one per target property). Set
   # automatically from the number of `target` properties; override only for
@@ -90,8 +101,8 @@ model:
     # dropout: null
     pre_norm: true
     post_norm: false
-  dropout: 0.05
-  act: gelu
+  dropout: 0.02
+  act: silu
   # Optional: node->graph aggregation. A single name ("MeanAggregation",
   # "SumAggregation", "MaxAggregation"), several combined — either a YAML list
   # or a "MeanAggregation+MaxAggregation" string (joined with MultiAggregation,
@@ -100,15 +111,15 @@ model:
   global_aggr: MeanAggregation+MaxAggregation+VariancePreservingAggregation+StdAggregation
 
 training:
-  batch_size: 64
+  batch_size: 16
   lr: 0.001
   weight_decay: 0.00001
-  max_epochs: 300
+  max_epochs: 2000
   patience: 50
   val_frac: 0.1
   test_frac: 0.1
   seed: 0
-  num_workers: 0
+  num_workers: 4
   accelerator: auto
   # Optimizer / scheduler names from the runner registries.
   optimizer_class: AdamW
@@ -117,13 +128,19 @@ training:
   scheduler_kwargs: {}
   scheduler_monitor: val_loss
   scheduler_interval: epoch      # "epoch" or "step" (use "step" for OneCycleLR)
+  # Gradient clipping (PyTorch Lightning Trainer kwargs). Set gradient_clip_val
+  # to a positive number (e.g. 1.0) to enable; 0 or null disables it.
+  # gradient_clip_algorithm: "norm" (default, clip by global gradient norm) or
+  # "value" (clip each gradient by value). CLI: --gradient_clip_val 1.0
+  gradient_clip_val: 4
+  gradient_clip_algorithm: norm
   # Cross-validation: set k_folds > 1 to run K-fold CV instead of the single
   # train/val/test split. With several distinct molecules a Group K-fold keeps
   # whole molecules in the same fold (no train/val leakage); with a single
   # molecule a repeated shuffled K-fold runs n_repeats passes. 1 / null keeps
   # the current single split.
-  k_folds: null
-  n_repeats: 3
+  k_folds: 5
+  n_repeats: 2
   # Standardize the target(s) (per-target mean/std fit on the training split)
   # before computing the loss; predictions are un-standardized for reporting.
   # Recommended for near-constant or large-magnitude targets (avoids a
@@ -140,10 +157,10 @@ logging:
   # Set to a W&B project name to enable W&B logging. When enabled, the run gets
   # a human-friendly auto-generated name from the hyperparameters (see
   # run_training._make_run_name); override it with `run_name` below.
-  wandb_project: BCP_HOMO_HyperOpt
+  wandb_project: BCP
   # Optional W&B niceties:
   run_name: null             # e.g. "gat-h256-l4-r6.0" (auto if null)
-  group: BCP_HOMO                       # group related runs together in the W&B UI
+  group: HOMO                       # group related runs together in the W&B UI
   tags: null                 # e.g. [baseline, gat]  (list)
   notes: null                # free-text description shown on the run page
   # Stdlib logging for the library + CLI (morphology_gnn._logging.configure_logging).

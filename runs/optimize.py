@@ -57,12 +57,12 @@ from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 
 from run_training import (  # noqa: E402  (sys.path fix above)
     DEFAULT_CONFIG,
-    CombinedH5MolecularDataset,
     _ensure_wandb_auth,
     _finalize_wandb,
     _log_config_to_wandb,
     _log_yaml_files_to_wandb,
     _make_run_name,
+    build_dataset,
     build_loaders,
     build_model,
     build_module,
@@ -70,6 +70,7 @@ from run_training import (  # noqa: E402  (sys.path fix above)
     configure_cuda,
     deep_merge,
     fit_target_scaler,
+    gradient_clip_kwargs,
     load_config,
     normalize_targets,
     require_radius,
@@ -165,16 +166,24 @@ def _suggest(space: dict, trial: optuna.Trial) -> dict:
     return overrides
 
 
-def _get_dataset(config: dict) -> CombinedH5MolecularDataset:
+def _get_dataset(config: dict):
+    """Build (and cache) the scalar-regression dataset for one trial.
+
+    Cache key includes the dataset layout so molecular and SCM-pure builds of
+    the same files/targets/radius do not collide.
+    """
     files = config["data"]
     if isinstance(files, str):
         files = [files]
     targets = normalize_targets(config["target"])
-    key = (tuple(files), tuple(targets), float(config["radius"]))
+    key = (
+        config.get("dataset", "molecular"),
+        tuple(files),
+        tuple(targets),
+        float(config["radius"]),
+    )
     if key not in _DATASET_CACHE:
-        _DATASET_CACHE[key] = CombinedH5MolecularDataset(
-            list(files), targets, radius=config["radius"]
-        )
+        _DATASET_CACHE[key] = build_dataset(config)
     return _DATASET_CACHE[key]
 
 
@@ -182,7 +191,7 @@ def _evaluate(module, loader, targets=None) -> dict:
     """Aggregate + per-target metrics over a loader (deterministic)."""
     module.eval()
     device = next(module.parameters()).device
-    ys, preds = [], []
+    ys, preds, groups = [], [], []
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
@@ -192,7 +201,17 @@ def _evaluate(module, loader, targets=None) -> dict:
             ys.append(batch.y.view_as(y_hat))
             # Un-standardize predictions into the original target units.
             preds.append(module.denormalize_targets(y_hat))
-    return compute_metrics(torch.cat(ys), torch.cat(preds), targets)
+            # Per-graph group labels (material/species or molecule id) for
+            # group-aware R2 (not inflated by pooling different materials).
+            for attr in ("species_name", "mol_name"):
+                if hasattr(batch, attr):
+                    groups.extend(str(g) for g in getattr(batch, attr))
+                    break
+            else:
+                groups.extend(str(i) for i in range(y_hat.shape[0]))
+    return compute_metrics(
+        torch.cat(ys), torch.cat(preds), targets, groups=groups or None
+    )
 
 
 def _build_trial_logger(trial, trial_config, args, study_name):
@@ -314,6 +333,7 @@ def _make_objective(base_config, search_space, args, study_name):
             enable_checkpointing=False,
             enable_progress_bar=not args.no_progress_bar,
             log_every_n_steps=10,
+            **gradient_clip_kwargs(trial_config["training"]),
             callbacks=callbacks,
         )
         try:

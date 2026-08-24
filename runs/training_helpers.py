@@ -30,6 +30,10 @@ from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GATConv, GCNConv, SAGEConv, GATv2Conv
 
+from morphology_gnn.data import (
+    CombinedH5MolecularDataset,
+    CombinedSCMMolecularDataset,
+)
 from morphology_gnn.model.envelope import (
     AbstractEnvelope,
     CosineEnvelope,
@@ -108,6 +112,13 @@ RBF_REGISTRY = RBF_REGISTRY  # re-exported from morphology_gnn.model.rbf
 DEFAULT_CONFIG = {
     "data": ["data/2-TNATA_ams.hdf5"],
     "target": "Positive VIP",
+    # Dataset layout: "molecular" (default) or "scm".
+    #   molecular — per-frame MD *_ams.hdf5 files (CombinedH5MolecularDataset).
+    #   scm       — SCM-pure per-molecule files in data/data_SCM_pure/
+    #               (CombinedSCMMolecularDataset); short-name targets (HOMO, S1,
+    #               ...) are resolved inside the dataset class. Select via the
+    #               `dataset:` config key or `--dataset scm` (see build_dataset()).
+    "dataset": "scm",
     # Radius-graph cutoff (Angstrom). REQUIRED — there is no built-in default;
     # every run must set it manually (config file `radius:` or --radius).
     "radius": None,
@@ -169,6 +180,11 @@ DEFAULT_CONFIG = {
         "scheduler_kwargs": {},
         "scheduler_monitor": "val_loss",
         "scheduler_interval": "epoch",
+        # Gradient clipping (PyTorch Lightning Trainer kwargs): maximum allowed
+        # gradient norm/value. 0 or None disables clipping. algorithm: "norm"
+        # (default, clip by global norm) or "value" (clip each grad by value).
+        "gradient_clip_val": None,
+        "gradient_clip_algorithm": "norm",
         # Cross-validation: k_folds > 1 runs K-fold CV instead of the single
         # train/val/test split. Group K-fold by molecule when the dataset has
         # several distinct molecules; repeated (shuffled) K-fold (n_repeats
@@ -214,6 +230,7 @@ DEFAULT_CONFIG = {
 FLAG_DEFS = [
     ("data", "data", dict(nargs="+")),
     ("target", "target", dict(nargs="+")),
+    ("dataset", "dataset", dict(choices=["molecular", "scm"])),
     ("radius", "radius", dict(type=float)),
     ("hidden_dim", "model.hidden_dim", dict(type=int)),
     ("num_layers", "model.num_layers", dict(type=int)),
@@ -244,6 +261,12 @@ FLAG_DEFS = [
     ("seed", "training.seed", dict(type=int)),
     ("num_workers", "training.num_workers", dict(type=int)),
     ("accelerator", "training.accelerator", {}),
+    ("gradient_clip_val", "training.gradient_clip_val", dict(type=float)),
+    (
+        "gradient_clip_algorithm",
+        "training.gradient_clip_algorithm",
+        dict(choices=["norm", "value"]),
+    ),
     ("outdir", "logging.outdir", {}),
     ("wandb_project", "logging.wandb_project", {}),
     ("run_name", "logging.run_name", {}),
@@ -329,6 +352,23 @@ def normalize_targets(target) -> list[str]:
     if isinstance(target, str):
         return [target]
     return list(target)
+
+
+def build_dataset(config: dict):
+    """Build the scalar-regression dataset from the resolved config.
+
+    ``dataset: molecular`` (default) -> per-frame MD files
+    (:class:`CombinedH5MolecularDataset`); ``dataset: scm`` -> SCM-pure
+    per-molecule files (:class:`CombinedSCMMolecularDataset`). Short-name SCM
+    targets (``HOMO``, ``S1``, ...) are resolved inside the dataset class.
+    """
+    data_files = config["data"]
+    if isinstance(data_files, str):
+        data_files = [data_files]
+    targets = normalize_targets(config["target"])
+    if config.get("dataset") == "scm":
+        return CombinedSCMMolecularDataset(data_files, targets, radius=config["radius"])
+    return CombinedH5MolecularDataset(data_files, targets, radius=config["radius"])
 
 
 # --- builders ----------------------------------------------------------------
@@ -572,6 +612,37 @@ def _fs_safe(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
 
 
+def resolve_run_outdir(config: dict, run_name: str | None = None) -> str:
+    """Give every run its own subfolder under ``logging.outdir``.
+
+    Resolves the run name (``run_name`` if given, else ``logging.run_name``,
+    else the auto-generated name), fixes it in the config so it is identical
+    everywhere (per-run folder, W&B run name, checkpoint filename prefix), and
+    returns the per-run outdir ``<base outdir>/<run name>``. The per-run path is
+    written back to ``config["logging"]["outdir"]`` so the CSV logger,
+    checkpoints, figures and CV results all land inside the run's own folder.
+    Call it once at the start of ``main()`` (after the config is fully resolved)
+    so the folder name and the W&B/checkpoint names always agree.
+
+    If a folder for that run name already exists (e.g. two runs auto-named in
+    the same second, or re-running an explicit ``--run_name``), a numeric suffix
+    (``__2``, ``__3``, ...) is appended to the *folder* so runs are never
+    overwritten; the run name itself is left unchanged.
+    """
+    if run_name is None:
+        run_name = config["logging"].get("run_name") or _resolve_run_name(config)
+    config["logging"]["run_name"] = run_name
+    outdir = os.path.join(config["logging"]["outdir"], _fs_safe(run_name))
+    base = outdir
+    n = 2
+    while os.path.exists(outdir):
+        outdir = f"{base}__{n}"
+        n += 1
+    config["logging"]["outdir"] = outdir
+    os.makedirs(outdir, exist_ok=True)
+    return outdir
+
+
 def _finalize_wandb(logger) -> None:
     """Explicitly mark the W&B run finished so it is never flagged as crashed.
 
@@ -694,6 +765,23 @@ def build_logger(config: dict, run_name_suffix: str = "", run_name: str | None =
     return CSVLogger(save_dir=logging_cfg.get("outdir", "runs/artifacts"), name="csv")
 
 
+def gradient_clip_kwargs(config: dict) -> dict:
+    """PyTorch Lightning Trainer kwargs for gradient clipping.
+
+    Returns ``{}`` when clipping is disabled (``gradient_clip_val`` falsy/None),
+    else ``{"gradient_clip_val": ..., "gradient_clip_algorithm": ...}`` — pass
+    straight to ``pl.Trainer(**gradient_clip_kwargs(train_cfg))``. algorithm is
+    ``"norm"`` (default, global-norm clip) or ``"value"`` (per-param clip).
+    """
+    val = config.get("gradient_clip_val")
+    if not val:
+        return {}
+    return {
+        "gradient_clip_val": float(val),
+        "gradient_clip_algorithm": config.get("gradient_clip_algorithm", "norm"),
+    }
+
+
 def build_callbacks(
     config: dict, ckpt_dir: str, name_prefix: str = "", monitor: str = "val_loss"
 ) -> list:
@@ -805,12 +893,49 @@ def sanitize_name(name: str) -> str:
     return re.sub(r"\W+", "_", name.strip()).strip("_").lower()
 
 
-def compute_metrics(truth, pred, targets: list[str] | None = None) -> dict:
+def _grouped_r2(truth, pred, groups):
+    """Per-group R2 and its sample-weighted mean (group-aware / within-group R2).
+
+    ``truth``/``pred``: 1-D tensors of one target; ``groups``: one label per row.
+    R2 is computed separately within each group, so a model that only separates
+    groups (e.g. different materials with different mean HOMO values) scores ~0
+    here instead of an inflated pooled R2. Returns ``(weighted_mean, {group: r2})``;
+    degenerate groups (n <= 1 or zero-variance truth) contribute ``nan`` and are
+    excluded from the weighted mean.
+    """
+    t = truth.detach().cpu().reshape(-1)
+    p = pred.detach().cpu().reshape(-1)
+    members: dict[str, list[int]] = {}
+    for i, g in enumerate(groups):
+        members.setdefault(str(g), []).append(i)
+    r2s: dict[str, float] = {}
+    weights: list[tuple[int, float]] = []
+    for lab, idx in members.items():
+        tt, pp = t[idx], p[idx]
+        if len(idx) > 1 and tt.std().item() > 1e-12:
+            r2s[lab] = float(r2_score(pp, tt))  # torch-based r2_score
+            weights.append((len(idx), r2s[lab]))
+        else:
+            r2s[lab] = float("nan")
+    wmean = (
+        sum(n * r for n, r in weights) / sum(n for n, _ in weights)
+        if weights
+        else float("nan")
+    )
+    return wmean, r2s
+
+
+def compute_metrics(truth, pred, targets: list[str] | None = None, groups=None) -> dict:
     """Aggregate + per-target regression metrics.
 
     Args:
         truth, pred: Tensors of shape ``(num_graphs, num_targets)``.
         targets: Optional target names used to label per-target keys.
+        groups: Optional per-graph group labels (e.g. material / species). When
+            given (one label per graph), ``r2`` becomes the sample-weighted mean
+            of the per-group R2s (``r2_within`` / ``r2_by_group``) so pooling
+            datasets with different means does not inflate R2; the plain pooled
+            R2 stays available as ``r2_pooled``.
 
     Returns:
         A dict with aggregate keys (``mse``, ``mae``, ``rmse``, ``r2``) and, for
@@ -820,30 +945,80 @@ def compute_metrics(truth, pred, targets: list[str] | None = None) -> dict:
     t = truth.detach().cpu()
     p = pred.detach().cpu()
     ft, fp = t.view(-1), p.view(-1)
+    pooled_r2 = r2_score(fp, ft).item()
     metrics = {
         "mse": ((ft - fp) ** 2).mean().item(),
         "mae": (ft - fp).abs().mean().item(),
         "rmse": ((ft - fp) ** 2).mean().sqrt().item(),
-        "r2": r2_score(fp, ft).item(),
+        "r2_pooled": pooled_r2,
     }
+    has_groups = groups is not None and len(groups) == t.shape[0]
+    if has_groups:
+        r2_within, r2_by_group = _grouped_r2(ft, fp, groups)
+    else:
+        r2_within, r2_by_group = pooled_r2, {}
+    if not (r2_within == r2_within):  # NaN -> fall back to pooled
+        r2_within = pooled_r2
+    metrics["r2"] = r2_within
+    metrics["r2_within"] = r2_within
+    metrics["r2_by_group"] = r2_by_group
     for i in range(t.shape[1]):
         ti, pi = t[:, i], p[:, i]
         metrics[f"target_{i}_mse"] = ((ti - pi) ** 2).mean().item()
         metrics[f"target_{i}_mae"] = (ti - pi).abs().mean().item()
         metrics[f"target_{i}_rmse"] = ((ti - pi) ** 2).mean().sqrt().item()
-        metrics[f"target_{i}_r2"] = r2_score(pi, ti).item()
+        metrics[f"target_{i}_r2_pooled"] = r2_score(pi, ti).item()
+        if has_groups:
+            g_w, g_b = _grouped_r2(ti, pi, groups)
+            g_w = pooled_r2 if not (g_w == g_w) else g_w
+            metrics[f"target_{i}_r2"] = g_w
+            metrics[f"target_{i}_r2_within"] = g_w
+            metrics[f"target_{i}_r2_by_group"] = g_b
+        else:
+            metrics[f"target_{i}_r2"] = metrics[f"target_{i}_r2_pooled"]
         if targets is not None and i < len(targets):
             tag = sanitize_name(targets[i])
             for metric in ("mse", "mae", "rmse", "r2"):
                 metrics[f"target_{tag}_{metric}"] = metrics[f"target_{i}_{metric}"]
+            metrics[f"target_{tag}_r2_pooled"] = metrics[f"target_{i}_r2_pooled"]
     return metrics
 
 
-def predict(module, loader):
-    """Return ``(y, y_hat)`` over a loader, each of shape (num_graphs, num_targets)."""
+def restore_best_checkpoint(module, trainer) -> str:
+    """Load the Trainer's best checkpoint weights into ``module`` in place.
+
+    After ``trainer.fit`` the module still holds the *last-epoch* weights, so
+    predictions / metrics / figures computed afterwards would not reflect the
+    best model. This reloads the weights of the best checkpoint (lowest
+    monitored loss, as saved by the ModelCheckpoint callback). Returns the
+    checkpoint path, or ``""`` when none was saved (weights left untouched).
+    """
+    ckpt_cb = getattr(trainer, "checkpoint_callback", None)
+    best_path = (
+        getattr(ckpt_cb, "best_model_path", None) if ckpt_cb is not None else None
+    )
+    if not best_path:
+        log.warning(
+            "no best checkpoint found; using in-memory (last-epoch) weights"
+        )
+        return ""
+    ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
+    module.load_state_dict(ckpt["state_dict"])
+    log.info("[best-ckpt] restored weights from %s", best_path)
+    return best_path
+
+
+def predict(module, loader, group_attr: str = "species_name"):
+    """Return ``(y, y_hat, groups)`` over a loader.
+
+    ``y`` / ``y_hat`` are tensors of shape ``(num_graphs, num_targets)`` (raw
+    target units). ``groups`` is a list of per-graph group labels used for
+    group-aware R2: the material/species label (``species_name``) when present,
+    else the molecule id (``mol_name``), else per-graph indices.
+    """
     module.eval()
     device = next(module.parameters()).device
-    ys, preds = [], []
+    ys, preds, groups = [], [], []
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
@@ -853,7 +1028,16 @@ def predict(module, loader):
             ys.append(batch.y.view_as(y_hat))
             # Un-standardize predictions into the original target units.
             preds.append(module.denormalize_targets(y_hat))
-    return torch.cat(ys), torch.cat(preds)
+            # Per-graph group labels: PyG batches string attrs into a list.
+            labels = None
+            for attr in (group_attr, "mol_name"):
+                if hasattr(batch, attr):
+                    labels = [str(g) for g in getattr(batch, attr)]
+                    break
+            if labels is None:
+                labels = [str(i) for i in range(y_hat.shape[0])]
+            groups.extend(labels)
+    return torch.cat(ys), torch.cat(preds), groups
 
 
 def plot_truth_vs_pred(ax, truth, pred, title) -> None:
@@ -965,10 +1149,18 @@ def _cv_splits(n, mol_ids, k_folds, n_repeats, seed):
 
 
 def _aggregate_fold_metrics(fold_metrics):
-    """``fold_metrics``: list of ``(label, metrics_dict)``. Return mean/std dicts."""
+    """``fold_metrics``: list of ``(label, metrics_dict)``. Return mean/std dicts.
+
+    Only scalar (int/float) metrics are aggregated; non-scalar entries (e.g. the
+    per-group R2 dict ``r2_by_group``) are skipped.
+    """
     import statistics
 
-    keys = list(fold_metrics[0][1].keys())
+    keys = [
+        k
+        for k in fold_metrics[0][1].keys()
+        if all(isinstance(m[k], (int, float)) for _, m in fold_metrics)
+    ]
     means, stds = {}, {}
     for k in keys:
         vals = [m[k] for _, m in fold_metrics]
@@ -979,6 +1171,12 @@ def _aggregate_fold_metrics(fold_metrics):
 
 def _write_cv_summary(cv_dir, fold_metrics, means, stds) -> str:
     import csv
+    import json
+
+    def _fmt(v):
+        if v is None:
+            return ""
+        return f"{v:.6f}" if isinstance(v, (int, float)) else json.dumps(v, default=str)
 
     keys = list(fold_metrics[0][1].keys())
     path = os.path.join(cv_dir, "cv_summary.csv")
@@ -986,9 +1184,9 @@ def _write_cv_summary(cv_dir, fold_metrics, means, stds) -> str:
         w = csv.writer(f)
         w.writerow(["fold"] + keys)
         for label, m in fold_metrics:
-            w.writerow([label] + [f"{m[k]:.6f}" for k in keys])
-        w.writerow(["mean"] + [f"{means[k]:.6f}" for k in keys])
-        w.writerow(["std"] + [f"{stds[k]:.6f}" for k in keys])
+            w.writerow([label] + [_fmt(m[k]) for k in keys])
+        w.writerow(["mean"] + [_fmt(means.get(k)) for k in keys])
+        w.writerow(["std"] + [_fmt(stds.get(k)) for k in keys])
     log.info("[cv] summary written to %s", path)
     return path
 
@@ -1064,6 +1262,7 @@ def _run_cross_validation(config, targets, dataset, outdir) -> None:
                 accelerator=training["accelerator"],
                 devices=1,
                 log_every_n_steps=10,
+                **gradient_clip_kwargs(training),
                 callbacks=build_callbacks(
                     config,
                     os.path.join(fold_dir, "checkpoints"),
@@ -1073,8 +1272,12 @@ def _run_cross_validation(config, targets, dataset, outdir) -> None:
             )
             trainer.fit(system, train_loader, val_loader)
 
-            truth, pred = predict(system, val_loader)
-            metrics = compute_metrics(truth, pred, targets)
+            # Evaluate the fold with the best checkpoint (not the last-epoch
+            # weights that remain in memory after fit).
+            restore_best_checkpoint(system, trainer)
+
+            truth, pred, groups = predict(system, val_loader)
+            metrics = compute_metrics(truth, pred, targets, groups=groups)
             fold_metrics.append((label, metrics))
             plot_path = os.path.join(fold_dir, "truth_vs_pred.png")
             save_truth_vs_pred_figure(
@@ -1122,9 +1325,22 @@ def _run_cross_validation(config, targets, dataset, outdir) -> None:
                         }
                     )
             keys = list(fold_metrics[0][1].keys())
+            import json as _json
+
             table = wandb.Table(
                 columns=cast("list[str | int]", ["fold"] + keys),
-                data=[[label] + [m[k] for k in keys] for label, m in fold_metrics],
+                data=[
+                    [label]
+                    + [
+                        (
+                            m[k]
+                            if isinstance(m[k], (int, float))
+                            else _json.dumps(m[k], default=str)
+                        )
+                        for k in keys
+                    ]
+                    for label, m in fold_metrics
+                ],
             )
             wandb.log({"cv/fold_metrics": table})
     finally:
