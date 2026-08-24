@@ -38,11 +38,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import torch  # noqa: E402
 from lightning.pytorch.loggers import CSVLogger  # noqa: E402
+from torch_geometric.data import Data, Dataset  # noqa: E402
 from torch_geometric.nn import GATConv  # noqa: E402
 
 from morphology_gnn.data import (  # noqa: E402
     CombinedH5MolecularDataset,
-    CombinedSCMDiffusionDataset,
+    CombinedSCMMolecularDataset,
 )
 from morphology_gnn.model.diffusion_model import DiffusionMoleculeModel  # noqa: E402
 from morphology_gnn.model.diffusion_trainer import (  # noqa: E402
@@ -69,6 +70,7 @@ from run_training import (  # noqa: E402
     _log_yaml_files_to_wandb,
     build_callbacks,
     build_loaders,
+    build_profiler,
     coerce,
     gradient_clip_kwargs,
     configure_cuda,
@@ -96,6 +98,10 @@ DEFAULT_CONFIG = {
     "target": "Positive VIP",
     # Radius-graph cutoff (Angstrom). REQUIRED — no built-in default.
     "radius": None,
+    # Keep the SCM HDF5 data resident in memory: load it once at dataset
+    # construction instead of re-reading the file on every accessor call. Only
+    # affects `dataset: scm` (CombinedSCMMolecularDataset). CLI: --keep_in_memory.
+    "keep_in_memory": False,
     "model": {
         "hidden_dim": 128,
         "num_layers": 2,
@@ -137,6 +143,18 @@ DEFAULT_CONFIG = {
         "gradient_clip_val": None,
         "gradient_clip_algorithm": "norm",
     },
+    # Profiling (optional): same `profiling` knobs as run_training.py — see
+    # training_helpers.build_profiler. "simple" = per-stage wall time; "torch"
+    # = torch.profiler chrome traces + top-op table under `<outdir>/profile/`.
+    "profiling": {
+        "kind": None,
+        "warmup": 2,
+        "active": 10,
+        "repeat": 1,
+        "profile_memory": False,
+        "record_shapes": False,
+        "with_stack": False,
+    },
     "sampling": {
         "steps": 100,
         "ddim": False,
@@ -162,6 +180,11 @@ FLAG_DEFS = [
     ("data", "data", dict(nargs="+")),
     ("radius", "radius", dict(type=float)),
     ("dataset", "dataset", dict(choices=["molecular", "scm"])),
+    (
+        "keep_in_memory",
+        "keep_in_memory",
+        dict(action="store_true", default=None),
+    ),
     ("hidden_dim", "model.hidden_dim", dict(type=int)),
     ("num_layers", "model.num_layers", dict(type=int)),
     ("heads", "model.heads", dict(type=int)),
@@ -179,6 +202,7 @@ FLAG_DEFS = [
     ("seed", "training.seed", dict(type=int)),
     ("num_workers", "training.num_workers", dict(type=int)),
     ("accelerator", "training.accelerator", {}),
+    ("profile", "profiling.kind", dict(choices=["simple", "torch", "advanced"])),
     ("gradient_clip_val", "training.gradient_clip_val", dict(type=float)),
     (
         "gradient_clip_algorithm",
@@ -371,21 +395,60 @@ def build_diffusion_module(model, config: dict) -> DiffusionMoleculeModule:
     return DiffusionMoleculeModule(model, **kw)
 
 
+class SCMBoxDataset(Dataset):
+    """One PyG sample per SCM-pure box, built on :class:`CombinedSCMMolecularDataset`.
+
+    The diffusion position-generator treats one periodic box as a single sample
+    whose *nodes are the molecules*: ``pos`` = molecule center-of-mass positions,
+    ``x`` = per-molecule species index, ``edge_index`` = PBC radius graph over the
+    COMs. These box-level samples are assembled by
+    :meth:`CombinedSCMMolecularDataset.box_sample` from the per-molecule dataset
+    (no dedicated diffusion dataset class is needed); :meth:`box_reference`
+    exposes the per-molecule metadata for full-box reconstruction at generation
+    time.
+    """
+
+    def __init__(self, molecular: CombinedSCMMolecularDataset, radius: float):
+        self.molecular = molecular
+        self.radius = radius
+        super().__init__(root=None)
+
+    def __len__(self) -> int:
+        return self.molecular.n_boxes()
+
+    def __getitem__(self, idx: int) -> Data:
+        """Load the box at flat index ``idx`` (one box per file)."""
+        return self.molecular.box_sample(idx, radius=self.radius)
+
+    def mol_ids(self) -> list[str]:
+        """Molecule identifier per sample: one box per file, file-qualified."""
+        return [f"{di}:{ds.mol_name}" for di, ds in enumerate(self.molecular.datasets)]
+
+    def box_reference(self, idx: int = 0) -> dict:
+        """Per-molecule reference metadata for the box at flat index ``idx``."""
+        return self.molecular.box_reference(idx)
+
+
 def build_dataset(config: dict):
     """Build the diffusion dataset from the resolved config.
 
     ``dataset: molecular`` -> per-frame MD files (:class:`CombinedH5MolecularDataset`,
-    per-atom positions). ``dataset: scm`` -> SCM-pure boxes
-    (:class:`CombinedSCMDiffusionDataset`, molecule center-of-mass positions). The
-    target is unused by the diffusion model, so the SCM dataset gets ``None``.
+    per-atom positions). ``dataset: scm`` -> SCM-pure boxes via
+    :class:`SCMBoxDataset` over :class:`CombinedSCMMolecularDataset`
+    (molecule center-of-mass positions). The target is unused by the diffusion
+    model, so the SCM dataset is built with ``target_key=None``.
     """
     data_files = config["data"]
     if isinstance(data_files, str):
         data_files = [data_files]
     if config.get("dataset") == "scm":
-        return CombinedSCMDiffusionDataset(
-            data_files, target_key=None, radius=config["radius"]
+        molecular = CombinedSCMMolecularDataset(
+            data_files,
+            target_key=None,
+            radius=config["radius"],
+            keep_in_memory=config.get("keep_in_memory", False),
         )
+        return SCMBoxDataset(molecular, radius=config["radius"])
     return CombinedH5MolecularDataset(
         data_files, config["target"], radius=config["radius"]
     )
@@ -558,7 +621,7 @@ def evaluate_generation(module, loader, sampling_cfg: dict, device):
         if has_box_ref:
             orig_idx = subset_indices[i] if subset_indices is not None else i
             # `base` is statically a PyG Dataset; box_reference only exists on the
-            # SCM diffusion datasets (guarded by has_box_ref above).
+            # SCM box dataset (guarded by has_box_ref above).
             ref["box_ref"] = getattr(base, "box_reference")(orig_idx)
         refs.append(ref)
 
@@ -707,6 +770,7 @@ def main() -> None:
             log_every_n_steps=10,
             **gradient_clip_kwargs(config["training"]),
             callbacks=callbacks,
+            profiler=build_profiler(config, outdir),
             logger=logger,
         )
         trainer.fit(module, train_loader, val_loader if has_val else None)

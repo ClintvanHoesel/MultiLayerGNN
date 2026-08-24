@@ -4,6 +4,52 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+try:
+    from .cuda_radius_graph import radius_graph_pbc as cuda_radius_graph_pbc
+
+    _cuda_available = True
+    logger.debug("CUDA radius graph extension available")
+except Exception as exc:
+    cuda_radius_graph_pbc = None
+    _cuda_available = False
+    logger.warning(
+        "CUDA radius graph unavailable (%s); using the Python implementation", exc
+    )
+
+
+def try_cuda_radius_graph_pbc(
+    pos: torch.Tensor,
+    r: float,
+    lattice: torch.Tensor,
+    loop: bool = False,
+    max_num_neighbors: int | None = None,
+) -> torch.Tensor:
+    if cuda_radius_graph_pbc is not None and _cuda_available:
+        try:
+            edge = cuda_radius_graph_pbc(
+                pos,
+                r=r,
+                lattice=lattice,
+                loop=loop,
+                max_num_neighbors=max_num_neighbors,
+            )
+        except Exception:
+            edge = radius_graph_pbc(
+                pos,
+                r=r,
+                lattice=lattice,
+                loop=loop,
+                max_num_neighbors=max_num_neighbors,
+            )
+    else:
+        edge = radius_graph_pbc(
+            pos, r=r, lattice=lattice, loop=loop, max_num_neighbors=max_num_neighbors
+        )
+    # The CUDA extension returns a CPU tensor (the wrapper copies the result back
+    # after the kernel); return on `pos.device` so callers always get a
+    # device-matched edge_index regardless of which path ran.
+    return edge.to(pos.device)
+
 
 def _normalize_lattice(lattice: torch.Tensor) -> tuple[torch.Tensor, bool]:
     """Resolve a lattice spec into ``(box, is_orthorhombic)``.
@@ -73,6 +119,32 @@ def min_image_disp(
     frac = disp @ inv_lattice  # (E, 3)
     frac = frac - torch.round(frac)
     return frac @ lattice.to(pos.dtype).to(device)
+
+
+def min_image_disp_batched(
+    pos: torch.Tensor, edge_index: torch.Tensor, box_per_node: torch.Tensor
+) -> torch.Tensor:
+    """Minimum-image displacement vectors for batched edges (orthorhombic cells).
+
+    Same convention as :func:`min_image_disp`, but each node carries its own
+    graph's box (``box_per_node``), so it works on the concatenated node/edge
+    tensors of a PyG batch where different graphs have different cells.
+
+    Args:
+        pos: Node positions, shape ``(N, 3)`` (concatenated over graphs).
+        edge_index: Connectivity, shape ``(2, E)``.
+        box_per_node: Per-node box lengths, shape ``(N, 3)`` (each node carries
+            its graph's box). Edges never cross graphs, so the box of the edge
+            source applies to the whole edge.
+
+    Returns:
+        Displacement vectors of shape ``(E, 3)`` (``pos[dst] - pos[src]`` under
+        the minimum-image convention).
+    """
+    src, dst = edge_index[0], edge_index[1]
+    disp = pos[dst] - pos[src]  # (E, 3)
+    box_e = box_per_node[src]  # (E, 3)
+    return disp - torch.round(disp / box_e) * box_e
 
 
 def wrap_pos_general(pos: torch.Tensor, lattice: torch.Tensor) -> torch.Tensor:
@@ -304,7 +376,7 @@ def rebuild_pbc_edges(
             continue
         sub_pos = batch_pos[mask]
         lattice = cell_mats[i] if cell_mats is not None else boxes[i]
-        sub_edge = radius_graph_pbc(
+        sub_edge = try_cuda_radius_graph_pbc(
             sub_pos,
             r=radius,
             lattice=lattice,
@@ -385,16 +457,7 @@ def radius_graph_pbc(
     device = pos.device
     lattice = lattice.to(device)
 
-    if lattice.ndim == 1:
-        if lattice.numel() != 3:
-            raise ValueError("lattice must have shape (3,) or (3, 3)")
-        box = lattice
-        is_orthorhombic = True
-    elif lattice.shape == (3, 3):
-        box = torch.diagonal(lattice)
-        is_orthorhombic = torch.allclose(lattice, torch.diag(box))
-    else:
-        raise ValueError("lattice must have shape (3,) or (3, 3)")
+    box, is_orthorhombic = _normalize_lattice(lattice)
 
     logger.debug(
         "radius_graph_pbc n=%d r=%.3f path=%s",

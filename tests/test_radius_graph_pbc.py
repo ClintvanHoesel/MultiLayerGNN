@@ -276,7 +276,9 @@ def test_invalid_lattice_shapes_raise():
 def test_cuda_matches_python(seed):
     pos, r, box, loop, mnn = random_config(seed)
     py = radius_graph_pbc(pos, r, box, loop=loop, max_num_neighbors=mnn)
-    cu = cuda_radius_graph_pbc(pos, r, box, loop=loop, max_num_neighbors=mnn)
+    # The CUDA extension now returns edge_index on the GPU; move it to CPU so it
+    # can be compared against the CPU Python reference.
+    cu = cuda_radius_graph_pbc(pos, r, box, loop=loop, max_num_neighbors=mnn).cpu()
     assert torch.equal(undirected_set(py), undirected_set(cu))
 
 
@@ -296,7 +298,7 @@ def test_cuda_matches_python_loop_and_mnn():
                 py = radius_graph_pbc(pos, r, box, loop=loop, max_num_neighbors=mnn)
                 cu = cuda_radius_graph_pbc(
                     pos, r, box, loop=loop, max_num_neighbors=mnn
-                )
+                ).cpu()  # extension returns GPU; compare on CPU
                 assert torch.equal(
                     undirected_set(py), undirected_set(cu)
                 ), f"loop={loop} mnn={mnn} N={N} r={r:.3f}"
@@ -335,7 +337,7 @@ def test_cuda_matches_python_on_real_data():
     for idx in range(min(3, len(ds))):
         data = ds[idx]
         py = radius_graph_pbc(data.pos, 6.0, data.lattice, loop=False)
-        cu = cuda_radius_graph_pbc(data.pos, 6.0, data.lattice, loop=False)
+        cu = cuda_radius_graph_pbc(data.pos, 6.0, data.lattice, loop=False).cpu()
         assert torch.equal(undirected_set(py), undirected_set(cu))
         # also verify against the exact reference
         ref = brute_force_pbc(data.pos, 6.0, data.lattice, loop=False)

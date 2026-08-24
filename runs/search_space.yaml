@@ -14,7 +14,7 @@
 
 model.hidden_dim:
   type: categorical
-  choices: [64, 128, 256, 512]
+  choices: [16, 32, 64, 128]
 
 model.num_layers:
   type: int
@@ -23,11 +23,11 @@ model.num_layers:
 
 model.heads:
   type: categorical
-  choices: [1, 2, 4, 8]
+  choices: [1, 2, 4, 8, 16]
 
 model.num_rbf:
   type: categorical
-  choices: [16, 32, 64]
+  choices: [16, 32, 64, 128]
 
 model.rbf_kwargs.rbf_class:
   type: categorical
@@ -41,17 +41,17 @@ model.rbf_kwargs.cutoff_fn:
   choices: ["CosineEnvelope", "PolynomialEnvelope", null]
 
 model.dropout:
-  type: float
-  low: 0.0
+  type: log_float
+  low: 0.0001
   high: 0.5
 
 model.act:
   type: categorical
   choices: ["gelu", "mish", "relu", "silu"]
 
-# model.conv_class:
-#   type: categorical
-#   choices: ["GATConv", "GCNConv", "SAGEConv"]
+model.conv_class:
+  type: categorical
+  choices: ["GATConv", "GATv2Conv"]
 
 # model.use_edge_features:
 #   type: categorical
@@ -59,12 +59,12 @@ model.act:
 
 training.lr:
   type: log_float
-  low: 0.0001
+  low: 0.00001
   high: 0.01
 
 training.batch_size:
   type: categorical
-  choices: [16, 32, 64]
+  choices: [4, 8, 16, 32]
 
 training.weight_decay:
   type: log_float
@@ -77,8 +77,8 @@ training.weight_decay:
 
 radius:
   type: float
-  low: 0.
-  high: 6.
+  low: 2.
+  high: 5.
 
 # Optional normalization search space (uncomment to tune). `model.norm` is the
 # first-class knob (applied inside the residual wrapper).

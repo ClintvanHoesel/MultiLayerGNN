@@ -1,14 +1,17 @@
-"""Tests for the SCM-pure "box" diffusion dataset.
+"""Tests for SCM-pure "box" samples built from the per-molecule SCM datasets.
 
+The diffusion runner needs no dedicated diffusion dataset class: box-level
+samples (molecules as nodes — COM positions, species, PBC radius graph over
+COMs) are assembled by ``SCMMolecularDataset.box_sample`` /
+``CombinedSCMMolecularDataset.box_sample`` from the per-molecule SCM datasets.
 Covers:
-* ``SCMDiffusionDataset`` sample shapes and fields (COM positions, species,
-  PBC radius graph, orthorhombic box).
-* ``CombinedSCMDiffusionDataset`` across several files + per-box ``mol_ids``.
+* ``box_sample`` shapes and fields (COM positions, species, PBC radius graph,
+  orthorhombic box) for a single file and across several files.
 * ``box`` collation to ``(B, 3)`` under PyG batching.
 * ``box_reference`` per-molecule metadata accessor.
 * COM fallback when ``molecules/position`` is absent (computed from atoms).
 * A small ``DiffusionMoleculeModule`` ``_corrupt`` / forward / ``sample_many``
-  pass over batched SCM box data (finite, in-cell).
+  pass over batched SCM box samples (finite, in-cell).
 """
 
 from __future__ import annotations
@@ -20,15 +23,17 @@ import torch
 from torch_geometric.data import Batch
 
 from morphology_gnn.data import (
-    CombinedSCMDiffusionDataset,
-    SCMDiffusionDataset,
+    CombinedSCMMolecularDataset,
+    SCMMolecularDataset,
     molecule_center_of_mass,
 )
 from morphology_gnn.model.diffusion_model import DiffusionMoleculeModel
 from morphology_gnn.model.diffusion_trainer import DiffusionMoleculeModule
 
 
-def _make_scm_file(path, n: int = 5, seed: int = 0, include_position: bool = True) -> str:
+def _make_scm_file(
+    path, n: int = 5, seed: int = 0, include_position: bool = True
+) -> str:
     """Write a small SCM-pure HDF5 file (one box of ``n`` identical C4 molecules).
 
     ``molecules/atoms`` is a compound dataset of shape ``(n, 4)`` with fields
@@ -43,9 +48,7 @@ def _make_scm_file(path, n: int = 5, seed: int = 0, include_position: bool = Tru
     atoms["x"] = 1.0
     atoms["y"] = 2.0
     atoms["z"] = 3.0
-    bond_dt = np.dtype(
-        [("atom_1", "<i8"), ("atom_2", "<i8"), ("bond_order", "<f8")]
-    )
+    bond_dt = np.dtype([("atom_1", "<i8"), ("atom_2", "<i8"), ("bond_order", "<f8")])
     bonds = np.zeros((n, 3), dtype=bond_dt)
     bonds["atom_1"] = [1, 2, 3]
     bonds["atom_2"] = [2, 3, 4]
@@ -72,11 +75,11 @@ def scm_file(tmp_path) -> str:
 # --------------------------------------------------------------------------- #
 # Dataset shapes / fields
 # --------------------------------------------------------------------------- #
-def test_scm_diffusion_dataset_shapes(scm_file):
-    ds = SCMDiffusionDataset(scm_file, target_key=None, radius=10.0)
-    assert len(ds) == 1
-    assert ds.mol_ids() == ["box"]
-    d = ds[0]
+def test_scm_box_sample_shapes(scm_file):
+    ds = SCMMolecularDataset(scm_file, target_key=None, radius=10.0)
+    assert len(ds) == 5  # 5 molecules in the box
+    assert ds.mol_name == "box"
+    d = ds.box_sample(radius=10.0)
     n = 5
     assert d.pos.shape == (n, 3)
     assert d.x.shape == (n, 1)
@@ -91,28 +94,33 @@ def test_scm_diffusion_dataset_shapes(scm_file):
     assert (d.pos >= 0).all() and (d.pos <= 10.0).all()
 
 
-def test_combined_dataset_and_mol_ids(tmp_path):
+def test_combined_box_samples_across_files(tmp_path):
     p1 = _make_scm_file(str(tmp_path / "a.hdf5"), n=6, seed=1)
     p2 = _make_scm_file(str(tmp_path / "b.hdf5"), n=5, seed=2)
-    ds = CombinedSCMDiffusionDataset([p1, p2], target_key=None, radius=10.0)
-    assert len(ds) == 2
-    assert ds.mol_ids() == ["0:a", "1:b"]
-    assert ds[0].pos.shape == (6, 3)
-    assert ds[1].pos.shape == (5, 3)
+    ds = CombinedSCMMolecularDataset([p1, p2], target_key=None, radius=10.0)
+    assert ds.n_boxes() == 2
+    # per-molecule samples still exposed for the normal trainer
+    assert len(ds) == 11
+    assert ds.box_sample(0).pos.shape == (6, 3)
+    assert ds.box_sample(1).pos.shape == (5, 3)
+    assert ds.box_sample(0).mol_name == "a"
+    assert ds.box_sample(1).mol_name == "b"
+    # file-qualified box ids (same convention the diffusion runner uses)
+    assert [f"{di}:{d.mol_name}" for di, d in enumerate(ds.datasets)] == ["0:a", "1:b"]
 
 
 def test_box_collates_to_batch(tmp_path):
     p1 = _make_scm_file(str(tmp_path / "a.hdf5"), n=6, seed=1)
     p2 = _make_scm_file(str(tmp_path / "b.hdf5"), n=5, seed=2)
-    ds = CombinedSCMDiffusionDataset([p1, p2], target_key=None, radius=10.0)
-    batch = Batch.from_data_list([ds[0], ds[1]])
+    ds = CombinedSCMMolecularDataset([p1, p2], target_key=None, radius=10.0)
+    batch = Batch.from_data_list([ds.box_sample(0), ds.box_sample(1)])
     assert batch.box.shape == (2, 3)
     assert batch.num_graphs == 2
     assert batch.pos.shape == (11, 3)
 
 
 def test_box_reference_accessor(scm_file):
-    ds = SCMDiffusionDataset(scm_file, target_key=None, radius=10.0)
+    ds = SCMMolecularDataset(scm_file, target_key=None, radius=10.0)
     ref = ds.box_reference()
     assert len(ref["atoms"]) == 5
     assert ref["com"].shape == (5, 3)
@@ -125,8 +133,8 @@ def test_box_reference_accessor(scm_file):
 def test_com_fallback_when_position_missing(tmp_path):
     """Without ``molecules/position`` the dataset recomputes the PBC COM."""
     p = _make_scm_file(str(tmp_path / "a.hdf5"), n=4, seed=4, include_position=False)
-    ds = SCMDiffusionDataset(p, target_key=None, radius=10.0)
-    d = ds[0]
+    ds = SCMMolecularDataset(p, target_key=None, radius=10.0)
+    d = ds.box_sample(radius=10.0)
     # every molecule's 4 atoms sit at (1, 2, 3): mass-weighted COM == (1, 2, 3).
     assert torch.allclose(d.pos[0], torch.tensor([1.0, 2.0, 3.0]), atol=1e-4)
 
@@ -138,6 +146,45 @@ def test_synthetic_com_matches_stored(tmp_path):
         atoms0 = np.asarray(hf["molecules/atoms"][0])
     com = molecule_center_of_mass(atoms0, lattice)
     assert torch.allclose(com, torch.tensor([1.0, 2.0, 3.0]), atol=1e-5)
+
+
+def test_keep_in_memory_matches_disk(scm_file):
+    """keep_in_memory=True yields identical samples to the default disk reads."""
+    disk = SCMMolecularDataset(scm_file, target_key=None, radius=10.0)
+    mem = SCMMolecularDataset(
+        scm_file, target_key=None, radius=10.0, keep_in_memory=True
+    )
+    assert mem._cache is not None
+    assert disk._cache is None
+    for i in range(len(disk)):
+        a, b = disk[i], mem[i]
+        assert torch.equal(a.x, b.x)
+        assert torch.allclose(a.pos, b.pos)
+        assert torch.equal(a.edge_index, b.edge_index)
+        assert torch.equal(a.box, b.box)
+        assert a.mol_name == b.mol_name
+        assert a.n_atoms == b.n_atoms
+    assert torch.equal(disk.lattice, mem.lattice)
+    assert torch.equal(disk.coms(), mem.coms())
+    assert torch.equal(disk.species_ids(), mem.species_ids())
+    assert torch.equal(disk.box_sample(radius=10.0).pos, mem.box_sample(radius=10.0).pos)
+    rd, rm = disk.box_reference(), mem.box_reference()
+    assert torch.equal(rd["com"], rm["com"])
+    assert torch.equal(rd["box"], rm["box"])
+    assert rd["species_names"] == rm["species_names"]
+    assert rd["species_smiles"] == rm["species_smiles"]
+
+
+def test_keep_in_memory_with_targets(tmp_path):
+    """Cached per-target reads match the disk-backed path."""
+    p = _make_scm_file(str(tmp_path / "t.hdf5"), n=4, seed=0)
+    with h5py.File(p, "a") as hf:
+        hf.create_dataset("energies/HOMO", data=np.arange(4, dtype=np.float64))
+    disk = SCMMolecularDataset(p, target_key="HOMO", radius=10.0)
+    mem = SCMMolecularDataset(p, target_key="HOMO", radius=10.0, keep_in_memory=True)
+    assert torch.allclose(disk._target_values(), mem._target_values())
+    assert torch.allclose(disk.target_mean_std()[0], mem.target_mean_std()[0])
+    assert torch.allclose(disk[0].y, mem[0].y)
 
 
 # --------------------------------------------------------------------------- #
@@ -153,8 +200,8 @@ def _small_diffusion_module(radius: float = 10.0) -> DiffusionMoleculeModule:
 def test_corrupt_and_predict_on_batched_boxes(tmp_path):
     p1 = _make_scm_file(str(tmp_path / "a.hdf5"), n=6, seed=1)
     p2 = _make_scm_file(str(tmp_path / "b.hdf5"), n=5, seed=2)
-    ds = CombinedSCMDiffusionDataset([p1, p2], target_key=None, radius=10.0)
-    batch = Batch.from_data_list([ds[0], ds[1]])
+    ds = CombinedSCMMolecularDataset([p1, p2], target_key=None, radius=10.0)
+    batch = Batch.from_data_list([ds.box_sample(0), ds.box_sample(1)])
 
     mod = _small_diffusion_module(radius=10.0)
     x_noisy, edge_index, t, eps = mod._corrupt(batch)
@@ -172,8 +219,8 @@ def test_corrupt_and_predict_on_batched_boxes(tmp_path):
 
 def test_sample_many_in_cell(tmp_path):
     p = _make_scm_file(str(tmp_path / "a.hdf5"), n=6, seed=1)
-    ds = SCMDiffusionDataset(p, target_key=None, radius=10.0)
-    d = ds[0]
+    ds = SCMMolecularDataset(p, target_key=None, radius=10.0)
+    d = ds.box_sample(radius=10.0)
     mod = _small_diffusion_module(radius=10.0)
     gen = mod.sample_many(d.x.squeeze(-1), d.box.squeeze(0), n=2, steps=5, seed=0)
     assert gen.shape == (2, 6, 3)

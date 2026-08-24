@@ -81,6 +81,7 @@ from training_helpers import (  # noqa: E402
     build_logger,
     build_model,
     build_module,
+    build_profiler,
     coerce,
     compute_metrics,
     configure_cuda,
@@ -283,6 +284,7 @@ def main() -> None:
             log_every_n_steps=10,
             **gradient_clip_kwargs(config["training"]),
             callbacks=callbacks,
+            profiler=build_profiler(config, outdir),
             logger=logger,
         )
         trainer.fit(system, train_loader, val_loader)

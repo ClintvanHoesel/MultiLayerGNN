@@ -23,7 +23,7 @@ data:
   - data/data_SCM_pure/2-TNATA.hdf5
 
 # Target property key(s) within each HDF5 group. UNUSED by the diffusion model
-# (no property conditioning); the SCM diffusion dataset ignores it entirely.
+# (no property conditioning); the SCM dataset is built with target_key=None.
 target: "HOMO"
 
 # Radius-graph cutoff (Angstrom) for the PBC neighbor list. REQUIRED — no
@@ -31,6 +31,11 @@ target: "HOMO"
 # NOTE: in SCM mode the graph connects molecule CENTERS, so use a COM-scale
 # cutoff (molecule separation, e.g. 15-25 A), NOT the ~4 A atomic value.
 radius: 20.0
+
+# Keep the SCM HDF5 data resident in memory: load it once at dataset
+# construction instead of re-reading the file on every accessor call. Only
+# affects `dataset: scm` (CombinedSCMMolecularDataset). CLI: --keep_in_memory.
+keep_in_memory: false
 
 # CUDA / hardware knobs.
 cuda:

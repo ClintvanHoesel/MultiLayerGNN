@@ -181,9 +181,11 @@ Two dataset layouts (`dataset:` in the config):
 
 - **`molecular`** (default): per-frame MD `*_ams.hdf5` files — the model
   generates **per-atom positions** (a molecule conformation inside its cell).
-- **`scm`**: SCM-pure boxes (`CombinedSCMDiffusionDataset`) — the model
-  generates the **N molecule center-of-mass positions** (`molecules/position`)
-  that make up the box.
+- **`scm`**: SCM-pure boxes — the model generates the **N molecule
+  center-of-mass positions** (`molecules/position`) that make up the box.
+  Box-level samples (molecules as nodes) are assembled from
+  `CombinedSCMMolecularDataset.box_sample` by the runner, so no dedicated
+  diffusion dataset class is needed.
 
 Configuration precedence is identical to `run_training.py`:
 

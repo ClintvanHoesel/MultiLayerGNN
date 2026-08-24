@@ -283,7 +283,10 @@ def _make_objective(base_config, search_space, args, study_name):
             trial_config["model"]["use_edge_features"] = False
 
         # Deterministic, per-trial seed (reproducible but distinct runs).
-        seed = (base_seed + trial.number) % (2**31)
+        if args.rotate_seeds:
+            seed = (base_seed + trial.number) % (2**31)
+        else:
+            seed = base_seed
         set_seed(seed)
         trial_config["training"]["seed"] = seed
         # Enable Tensor Cores (TF32) + silence the "Tensor Cores" warning when
@@ -465,6 +468,11 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--seed", type=int, default=None, help="Override base training.seed."
+    )
+    parser.add_argument(
+        "--rotate-seeds",
+        action="store_true",
+        help="Turn on rotating seeds, instead of using a fixed one.",
     )
     parser.add_argument(
         "--log-level",

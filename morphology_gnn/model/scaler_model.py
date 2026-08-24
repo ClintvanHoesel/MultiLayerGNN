@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch_geometric.nn import GATConv
 from torch_geometric.nn.aggr import MeanAggregation, MultiAggregation
+from torch_geometric.utils import scatter
 from .residual import NORM_REGISTRY, Residual
 
 from .embedding import AtomTypeEmbedding, EdgeVectorLayer
@@ -62,6 +63,7 @@ class ScalarMoleculeModel(torch.nn.Module):
         global_aggr=MeanAggregation,
         atom_emb_kwargs: dict | None = None,
         use_edge_features: bool = False,
+        pbc_edge_features: bool = False,
         num_rbf: int = 50,
         rbf_kwargs: dict | None = None,
         cutoff_lower: float | None = None,
@@ -89,6 +91,9 @@ class ScalarMoleculeModel(torch.nn.Module):
         self.global_aggr = aggs[0] if len(aggs) == 1 else MultiAggregation(aggs)
 
         self.use_edge_features = use_edge_features
+        self.pbc_edge_features = pbc_edge_features
+        if pbc_edge_features and not use_edge_features:
+            raise ValueError("pbc_edge_features=True requires use_edge_features=True")
         self.num_rbf = num_rbf
 
         # RBF distance-embedding cutoffs: `cutoff_lower` / `cutoff_upper` are
@@ -231,7 +236,32 @@ class ScalarMoleculeModel(torch.nn.Module):
         edge_index: torch.Tensor,
         batch: torch.Tensor,
         pos: torch.Tensor | None = None,
+        mol_index: torch.Tensor | None = None,
+        mol_is_query: torch.Tensor | None = None,
+        box: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Graph-level (or per-molecule) scalar predictions.
+
+        Args:
+            x: ``(N,)`` atom types.
+            edge_index: ``(2, E)`` connectivity.
+            batch: ``(N,)`` graph index per node.
+            pos: Optional ``(N, 3)`` node positions (required with
+                ``use_edge_features``).
+            mol_index: Optional ``(N,)`` molecule id per node (query = 0). When
+                given, the model runs a *per-molecule* readout over every
+                molecule in the (query + context) graph and returns only the
+                query molecule's prediction per sample -- surrounding molecules
+                are passed through message passing but never trained on.
+            mol_is_query: Optional ``(N,)`` boolean mask, True for the query
+                molecule's atoms. Required together with ``mol_index`` so the
+                query prediction can be extracted from the per-molecule output.
+            box: Optional ``(B, 3)`` per-graph box lengths. Required with
+                ``pbc_edge_features`` (minimum-image edge displacements).
+
+        Returns:
+            Predictions of shape ``(batch_size, num_targets)``.
+        """
         # x: (N,) atom types; edge_index: (2, E); batch: (N,)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -249,7 +279,18 @@ class ScalarMoleculeModel(torch.nn.Module):
                     "use_edge_features=True requires `pos` (node positions) "
                     "to be passed to forward"
                 )
-            edge_attr = self.edge_layer(pos, edge_index)  # (E, num_rbf)
+            if self.pbc_edge_features:
+                if box is None:
+                    raise ValueError(
+                        "pbc_edge_features=True requires `box` (per-graph box "
+                        "lengths, shape (B, 3)) to be passed to forward"
+                    )
+                box_per_node = box[batch]  # (N, 3)
+                edge_attr = self.edge_layer(
+                    pos, edge_index, box_per_node=box_per_node
+                )  # (E, num_rbf)
+            else:
+                edge_attr = self.edge_layer(pos, edge_index)  # (E, num_rbf)
         for i, conv in enumerate(self.convs):
             if self.use_residual:
                 # The residual wrapper consumes `batch` for per-graph
@@ -267,6 +308,33 @@ class ScalarMoleculeModel(torch.nn.Module):
             x = self.act(x)
             if i < self.num_layers - 1:
                 x = F.dropout(x, p=self.dropout, training=self.training)
+
+        if mol_index is not None:
+            # Per-molecule readout over the whole (query + context) graph: every
+            # molecule of the graph is pooled to one vector and mapped through
+            # the head, then only the query molecule's row is returned so the
+            # loss is computed on the minibatch (query) molecules only.
+            mol_stride = int(mol_index.max().item()) + 1
+            mol_key = mol_index + batch * mol_stride  # unique (sample, molecule)
+            x = self.global_aggr(x, mol_key)  # (total_mol, hidden_dim)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            pred = self.lin(x)  # (total_mol, num_targets)
+            if mol_is_query is None:
+                raise ValueError(
+                    "mol_is_query is required when mol_index is given (context "
+                    "mode); mark which atoms belong to the query molecule(s)"
+                )
+            query_per_mol = (
+                scatter(
+                    mol_is_query.to(pred.device).long(),
+                    mol_key,
+                    dim=0,
+                    reduce="max",
+                )
+                > 0
+            )  # (total_mol,) bool, one True per sample (the query molecule)
+            return pred[query_per_mol]  # (batch_size, num_targets)
+
         x = self.global_aggr(x, batch)  # (batch_size, hidden_dim)
         x = F.dropout(x, p=self.dropout, training=self.training)
-        return self.lin(x)  # (batch_size, 1)
+        return self.lin(x)  # (batch_size, num_targets)

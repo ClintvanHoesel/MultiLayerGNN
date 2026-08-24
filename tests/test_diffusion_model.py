@@ -165,16 +165,25 @@ def test_rebuild_pbc_edges_matches_per_graph():
     n1, n2 = 20, 25
     pos = torch.cat([torch.rand(n1, 3) * box[0], torch.rand(n2, 3) * box[1]])
     batch = torch.cat([torch.zeros(n1), torch.ones(n2)]).long()
+
+    def sorted_edges(ei):
+        # Edge column ORDER is not a contract: the CUDA and Python radius-graph
+        # paths emit the same edge set in different orders, so compare sorted
+        # columns (order-insensitive) rather than torch.equal.
+        return sorted(map(tuple, ei.t().tolist()))
+
     ei = rebuild_pbc_edges(pos, batch, box, 4.0)
     e0 = radius_graph_pbc(pos[:n1], r=4.0, lattice=box[0], loop=False)
     e1 = radius_graph_pbc(pos[n1:], r=4.0, lattice=box[1], loop=False) + n1
     ref = torch.cat([e0, e1], dim=1)
-    assert torch.equal(ei, ref)
+    assert ei.shape == ref.shape
+    assert sorted_edges(ei) == sorted_edges(ref)
     # works with (B, 3, 3) lattice matrices too
     ei_mat = rebuild_pbc_edges(
         pos, batch, torch.stack([torch.diag(b) for b in box]), 4.0
     )
-    assert torch.equal(ei_mat, ref)
+    assert ei_mat.shape == ref.shape
+    assert sorted_edges(ei_mat) == sorted_edges(ref)
 
 
 # --------------------------------------------------------------------------- #

@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cmath>
@@ -168,42 +169,52 @@ torch::Tensor radius_graph_pbc_cuda(
     const int threads = 128;
     const int blocks = static_cast<int>((N + threads - 1) / threads);
 
-    count_edges_kernel<<<blocks, threads>>>(
+    // Launch every kernel on the torch *current* stream so the raw kernels and
+    // the torch ops below (cumsum / .item) are strictly ordered on one stream —
+    // no explicit device synchronisations are needed and no CPU copies happen.
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    count_edges_kernel<<<blocks, threads, 0, stream.stream()>>>(
         pos.data_ptr<float>(),
         N,
         lattice.data_ptr<float>(),
         r2,
         loop,
         counts.data_ptr<int64_t>());
-    cudaDeviceSynchronize();
+    // No device->host copy of `counts` and no explicit synchronisation: the
+    // prefix sums below run on the GPU on the same stream (so they serialise
+    // after the count kernel), and the only host sync is the single scalar
+    // .item() used to size the output tensor.
 
-    auto counts_cpu = counts.to(torch::kCPU);
-    auto counts_data = counts_cpu.data_ptr<int64_t>();
+    // Per-node output degree: capped at max_num_neighbors when requested.
+    torch::Tensor capped_counts = counts;
+    if (max_num_neighbors > 0)
+    {
+        auto cap = torch::full({N}, static_cast<int64_t>(max_num_neighbors),
+                               torch::dtype(torch::kInt64).device(pos.device()));
+        capped_counts = torch::minimum(counts, cap);
+    }
 
-    // Full prefix sums (all collected neighbors) and capped prefix sums
-    // (the closest max_num_neighbors, or all of them when max_num_neighbors <= 0).
-    auto full_starts_cpu = torch::empty({N + 1}, torch::dtype(torch::kInt64));
-    auto full_starts_data = full_starts_cpu.data_ptr<int64_t>();
-    auto capped_starts_cpu = torch::empty({N}, torch::dtype(torch::kInt64));
-    auto capped_starts_data = capped_starts_cpu.data_ptr<int64_t>();
+    // Inclusive prefix sums on the GPU; shift right by one to get the exclusive
+    // starts used by the collect/select kernels.
+    auto full_cum = torch::cumsum(counts, 0);       // (N,)  = [c0, c0+c1, ...]
+    auto capped_cum = torch::cumsum(capped_counts, 0);
 
     int64_t total_full = 0;
     int64_t total_out = 0;
-    full_starts_data[0] = 0;
-    for (int64_t i = 0; i < N; ++i)
+    if (N > 0)
     {
-        total_full += counts_data[i];
-        full_starts_data[i + 1] = total_full;
-
-        int64_t k = (max_num_neighbors > 0 && max_num_neighbors < counts_data[i])
-                        ? max_num_neighbors
-                        : counts_data[i];
-        capped_starts_data[i] = total_out;
-        total_out += k;
+        total_full = full_cum[N - 1].item<int64_t>();
+        total_out = capped_cum[N - 1].item<int64_t>();
     }
 
-    auto full_starts = full_starts_cpu.to(pos.device());
-    auto capped_starts = capped_starts_cpu.to(pos.device());
+    // full_starts has size N+1 (the collect/select kernels read starts[i+1]);
+    // capped_starts has size N.
+    auto opts = torch::dtype(torch::kInt64).device(pos.device());
+    auto full_starts = torch::cat({torch::zeros({1}, opts), full_cum});
+    auto capped_starts = torch::cat(
+        {torch::zeros({1}, opts), capped_cum.narrow(0, 0, N > 0 ? N - 1 : 0)});
+
     auto edge_index = torch::empty({2, total_out}, torch::dtype(torch::kInt64).device(pos.device()));
 
     if (total_full > 0)
@@ -212,7 +223,7 @@ torch::Tensor radius_graph_pbc_cuda(
         auto scratch_col = torch::empty({total_full}, torch::dtype(torch::kInt64).device(pos.device()));
         auto chosen = torch::empty({total_full}, torch::dtype(torch::kUInt8).device(pos.device()));
 
-        collect_edges_kernel<<<blocks, threads>>>(
+        collect_edges_kernel<<<blocks, threads, 0, stream.stream()>>>(
             pos.data_ptr<float>(),
             N,
             lattice.data_ptr<float>(),
@@ -221,9 +232,7 @@ torch::Tensor radius_graph_pbc_cuda(
             full_starts.data_ptr<int64_t>(),
             scratch_dist.data_ptr<float>(),
             scratch_col.data_ptr<int64_t>());
-        cudaDeviceSynchronize();
-
-        select_k_edges_kernel<<<blocks, threads>>>(
+        select_k_edges_kernel<<<blocks, threads, 0, stream.stream()>>>(
             N,
             max_num_neighbors,
             full_starts.data_ptr<int64_t>(),
@@ -233,7 +242,6 @@ torch::Tensor radius_graph_pbc_cuda(
             chosen.data_ptr<unsigned char>(),
             edge_index[0].data_ptr<int64_t>(),
             edge_index[1].data_ptr<int64_t>());
-        cudaDeviceSynchronize();
     }
 
     return edge_index;

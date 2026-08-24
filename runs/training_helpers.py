@@ -17,6 +17,7 @@ from typing import Protocol, Sequence, cast
 
 import lightning.pytorch as pl
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -26,9 +27,23 @@ import torch.nn.functional as F
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks.model_checkpoint import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
+from lightning.pytorch.profilers import (
+    PyTorchProfiler,
+    SimpleProfiler,
+    AdvancedProfiler,
+)
 from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GATConv, GCNConv, SAGEConv, GATv2Conv
+from torch_geometric.nn import (
+    GATConv,
+    GCNConv,
+    SAGEConv,
+    CuGraphSAGEConv,
+    GATv2Conv,
+    CuGraphGATConv,
+    RGCNConv,
+    CuGraphRGCNConv,
+)
 
 from morphology_gnn.data import (
     CombinedH5MolecularDataset,
@@ -60,10 +75,14 @@ log = logging.getLogger("morphology_gnn.runs.training_helpers")
 
 # --- registries: resolve config strings to classes / functions ----------------
 CONV_REGISTRY = {
-    "GATv2Conv": GATv2Conv,
     "GATConv": GATConv,
+    "CuGraphGATConv": CuGraphGATConv,
+    "GATv2Conv": GATv2Conv,
     "GCNConv": GCNConv,
     "SAGEConv": SAGEConv,
+    "CuGraphSAGEConv": CuGraphSAGEConv,
+    "RGCNConv": RGCNConv,
+    "CuGraphRGCNConv": CuGraphRGCNConv,
 }
 ACT_REGISTRY = {
     "mish": F.mish,
@@ -122,6 +141,11 @@ DEFAULT_CONFIG = {
     # Radius-graph cutoff (Angstrom). REQUIRED — there is no built-in default;
     # every run must set it manually (config file `radius:` or --radius).
     "radius": None,
+    # Keep the SCM HDF5 data resident in memory: load it once at dataset
+    # construction instead of re-reading the file on every __getitem__ /
+    # accessor call. Only affects `dataset: scm` (SCMMolecularDataset /
+    # CombinedSCMMolecularDataset). CLI: --keep_in_memory.
+    "keep_in_memory": False,
     "model": {
         "hidden_dim": 128,
         "num_layers": 2,
@@ -205,6 +229,25 @@ DEFAULT_CONFIG = {
         # Tensor Cores (e.g. RTX 20xx and newer).
         "tensor_cores": False,
     },
+    # Profiling (optional): `kind` selects a Lightning profiler for a training
+    # run. null (default) disables profiling; "simple" records per-stage wall
+    # time (data loading vs forward vs backward); "torch" wraps torch.profiler
+    # with a step schedule (warmup/active) and writes chrome traces under
+    # `<logging.outdir>/<run>/profile/` plus a printed top-op table. Set via
+    # config `profiling.kind` or the `--profile simple|torch` CLI flag.
+    "profiling": {
+        "kind": None,
+        # torch.profiler schedule: skip `warmup` steps, then record `active`
+        # steps (see torch.profiler.schedule). Raise `warmup` to skip past
+        # one-time setup overhead; lower `active` for a shorter trace.
+        "warmup": 2,
+        "active": 10,
+        "repeat": 1,
+        # Extra torch.profiler options (more detail, more overhead).
+        "profile_memory": False,
+        "record_shapes": False,
+        "with_stack": False,
+    },
     "logging": {
         "outdir": "runs/artifacts",
         "wandb_project": None,
@@ -232,6 +275,11 @@ FLAG_DEFS = [
     ("target", "target", dict(nargs="+")),
     ("dataset", "dataset", dict(choices=["molecular", "scm"])),
     ("radius", "radius", dict(type=float)),
+    (
+        "keep_in_memory",
+        "keep_in_memory",
+        dict(action="store_true", default=None),
+    ),
     ("hidden_dim", "model.hidden_dim", dict(type=int)),
     ("num_layers", "model.num_layers", dict(type=int)),
     ("heads", "model.heads", dict(type=int)),
@@ -261,6 +309,7 @@ FLAG_DEFS = [
     ("seed", "training.seed", dict(type=int)),
     ("num_workers", "training.num_workers", dict(type=int)),
     ("accelerator", "training.accelerator", {}),
+    ("profile", "profiling.kind", dict(choices=["simple", "torch", "advanced"])),
     ("gradient_clip_val", "training.gradient_clip_val", dict(type=float)),
     (
         "gradient_clip_algorithm",
@@ -367,7 +416,12 @@ def build_dataset(config: dict):
         data_files = [data_files]
     targets = normalize_targets(config["target"])
     if config.get("dataset") == "scm":
-        return CombinedSCMMolecularDataset(data_files, targets, radius=config["radius"])
+        return CombinedSCMMolecularDataset(
+            data_files,
+            targets,
+            radius=config["radius"],
+            keep_in_memory=config.get("keep_in_memory", False),
+        )
     return CombinedH5MolecularDataset(data_files, targets, radius=config["radius"])
 
 
@@ -811,6 +865,61 @@ def build_callbacks(
     ]
 
 
+def build_profiler(config: dict, outdir: str):
+    """Build a Lightning profiler from the ``profiling`` config section.
+
+    Returns ``None`` when profiling is disabled (the default,
+    ``profiling.kind`` is null). ``profiling.kind``:
+      - ``"simple"`` -> :class:`pl.profilers.SimpleProfiler` (``extended=True``):
+        per-stage wall-clock totals (data loading vs ``training_step`` vs
+        ``forward`` vs ``backward``), printed to stdout at the end of
+        ``trainer.fit``.
+      - ``"torch"`` -> :class:`pl.profilers.PyTorchProfiler` wrapping
+        ``torch.profiler`` with a step schedule (skip ``warmup`` steps, record
+        ``active`` steps). On each recorded step a chrome trace is written to
+        ``<outdir>/profile/`` and a top-op table (sorted by CUDA time) is
+        printed — the raw material for finding GPU/CPU bottlenecks.
+    """
+    prof_cfg = config.get("profiling") or {}
+    kind = prof_cfg.get("kind")
+    if kind is None or kind is False or str(kind).lower() in ("null", "none", "false"):
+        return None
+    if kind == "simple":
+        return SimpleProfiler(extended=True)
+    if kind == "advanced":
+        return AdvancedProfiler()
+    if kind != "torch":
+        raise ValueError(f"profiling.kind must be 'simple' or 'torch', got: {kind!r}")
+    import torch.profiler as torch_profiler
+
+    prof_dir = os.path.join(outdir, "profile")
+    os.makedirs(prof_dir, exist_ok=True)
+    schedule = torch_profiler.schedule(
+        wait=int(prof_cfg.get("warmup", 2) or 0),
+        warmup=1,
+        active=int(prof_cfg.get("active", 10) or 1),
+        repeat=int(prof_cfg.get("repeat", 1) or 1),
+    )
+
+    def _on_trace_ready(prof):
+        path = os.path.join(prof_dir, f"trace-{prof.step_num}.json")
+        try:
+            prof.export_chrome_trace(path)
+        except Exception as exc:  # pragma: no cover - best-effort export
+            log.warning("[profiler] could not export chrome trace: %s", exc)
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+
+    return PyTorchProfiler(
+        dirpath=prof_dir,
+        schedule=schedule,
+        on_trace_ready=_on_trace_ready,
+        record_shapes=bool(prof_cfg.get("record_shapes", False)),
+        profile_memory=bool(prof_cfg.get("profile_memory", False)),
+        with_stack=bool(prof_cfg.get("with_stack", False)),
+        with_flops=False,
+    )
+
+
 # --- data ---------------------------------------------------------------------
 def build_loaders(dataset: Dataset, train_cfg: dict):
     n = len(dataset)
@@ -998,9 +1107,7 @@ def restore_best_checkpoint(module, trainer) -> str:
         getattr(ckpt_cb, "best_model_path", None) if ckpt_cb is not None else None
     )
     if not best_path:
-        log.warning(
-            "no best checkpoint found; using in-memory (last-epoch) weights"
-        )
+        log.warning("no best checkpoint found; using in-memory (last-epoch) weights")
         return ""
     ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
     module.load_state_dict(ckpt["state_dict"])
@@ -1047,6 +1154,9 @@ def plot_truth_vs_pred(ax, truth, pred, title) -> None:
     sns.scatterplot(x=x, y=y, s=5, color=".15", ax=ax)
     sns.histplot(x=x, y=y, bins=50, pthresh=0.1, cmap="mako", ax=ax)
     sns.kdeplot(x=x, y=y, levels=5, color="w", linewidths=1, ax=ax)
+    max = np.max([np.max(x), np.max(y)])
+    min = np.min([np.min(x), np.min(y)])
+    ax.plot([min, max], [min, max], "k--", lw=2.0)
     ax.set_xlabel("Truth")
     ax.set_ylabel("Predicted")
     ax.set_title(title)

@@ -4,6 +4,7 @@ import logging
 import torch
 
 from .rbf import AbstractRBF, GaussianRBF, resolve_rbf_class
+from morphology_gnn.radius_graph import min_image_disp_batched
 
 logger = logging.getLogger(__name__)
 
@@ -220,12 +221,22 @@ class EdgeVectorLayer(torch.nn.Module):
     def embedding_dim(self) -> int:
         return self.edge_emb.embedding_dim
 
-    def forward(self, pos: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        pos: torch.Tensor,
+        edge_index: torch.Tensor,
+        box_per_node: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Embed edge displacements from node positions.
 
         Args:
             pos: Node positions, shape ``(N, 3)``.
             edge_index: Connectivity, shape ``(2, E)``.
+            box_per_node: Optional per-node box lengths ``(N, 3)``. When given
+                the displacement is the periodic minimum-image vector
+                (``pos[dst] - pos[src]`` wrapped into the cell) -- the correct
+                distance for edges that cross the periodic boundary (e.g.
+                inter-molecular context edges between neighbouring molecules).
 
         Returns:
             Edge attributes of shape ``(E, num_rbf)``.
@@ -236,5 +247,8 @@ class EdgeVectorLayer(torch.nn.Module):
             pos.shape[0],
             self.embedding_dim,
         )
-        displacement = pos[edge_index[1]] - pos[edge_index[0]]  # (E, 3)
+        if box_per_node is not None:
+            displacement = min_image_disp_batched(pos, edge_index, box_per_node)
+        else:
+            displacement = pos[edge_index[1]] - pos[edge_index[0]]  # (E, 3)
         return self.edge_emb(displacement)

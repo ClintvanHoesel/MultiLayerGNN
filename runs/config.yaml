@@ -27,13 +27,19 @@ data:
 # Target property key(s) within each HDF5 group. Use a single string for one
 # property, or a list to train on several at once (the model outputs one value
 # per target; loss/metrics average over all of them).
-target: "HOMO"
+target: "Positive VIP"
 # target: ["Positive VIP", "HOMO"]
 
 # Radius-graph cutoff (Angstrom). REQUIRED — no default: every run must set it
 # manually (here, or with --radius). This is the cutoff for building edges
 # between atoms (radius_graph / radius_graph_pbc).
 radius: 5
+
+# Keep the SCM HDF5 data resident in memory: load it once at dataset
+# construction instead of re-reading the file on every __getitem__ / accessor
+# call. Only affects `dataset: scm` (SCMMolecularDataset /
+# CombinedSCMMolecularDataset). CLI: --keep_in_memory.
+keep_in_memory: true
 
 # CUDA / hardware knobs.
 cuda:
@@ -44,11 +50,11 @@ cuda:
   tensor_cores: true
 
 model:
-  hidden_dim: 512
+  hidden_dim: 128
   num_layers: 8
   # Attention heads (only used when conv_class is GATConv).
-  heads: 4
-  num_rbf: 64
+  heads: 8
+  num_rbf: 32
   # Use geometric edge features (bond distances via RBF). For a single molecule
   # with near-identical frames, plain mean-pooled atom embeddings are almost the
   # same across samples, so the model cannot even overfit; edge distances are
@@ -114,8 +120,8 @@ training:
   batch_size: 16
   lr: 0.001
   weight_decay: 0.00001
-  max_epochs: 2000
-  patience: 50
+  max_epochs: 100
+  patience: 15
   val_frac: 0.1
   test_frac: 0.1
   seed: 0
@@ -139,7 +145,7 @@ training:
   # whole molecules in the same fold (no train/val leakage); with a single
   # molecule a repeated shuffled K-fold runs n_repeats passes. 1 / null keeps
   # the current single split.
-  k_folds: 5
+  k_folds: null
   n_repeats: 2
   # Standardize the target(s) (per-target mean/std fit on the training split)
   # before computing the loss; predictions are un-standardized for reporting.
@@ -152,6 +158,9 @@ training:
   # reported per split at the end of every run.
   # extra_metrics: {mae: l1_loss, rmse: mse_loss, r2: r2}
 
+profiling:
+  kind: null
+
 logging:
   outdir: runs/artifacts
   # Set to a W&B project name to enable W&B logging. When enabled, the run gets
@@ -160,7 +169,7 @@ logging:
   wandb_project: BCP
   # Optional W&B niceties:
   run_name: null             # e.g. "gat-h256-l4-r6.0" (auto if null)
-  group: HOMO                       # group related runs together in the W&B UI
+  group: Positive-VIP                       # group related runs together in the W&B UI
   tags: null                 # e.g. [baseline, gat]  (list)
   notes: null                # free-text description shown on the run page
   # Stdlib logging for the library + CLI (morphology_gnn._logging.configure_logging).
