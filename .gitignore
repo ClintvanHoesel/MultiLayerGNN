@@ -15,7 +15,11 @@ __pycache__/
 wandb/
 notebooks/wandb/
 runs/artifacts/
+runs/artifacts*/
 *.ckpt
+
+morphology_gnn/cuda_radius_graph/_build
+build/
 
 .vscode/
 .continue/

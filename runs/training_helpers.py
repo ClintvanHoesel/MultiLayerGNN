@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import warnings
-from typing import Protocol, Sequence, cast
+from typing import Literal, Protocol, Sequence, cast, overload
 
 import lightning.pytorch as pl
 import matplotlib
@@ -88,6 +88,7 @@ ACT_REGISTRY = {
     "mish": F.mish,
     "gelu": F.gelu,
     "relu": F.relu,
+    "leakyrelu": F.leaky_relu,
     "silu": F.silu,
     "tanh": torch.tanh,
 }
@@ -146,6 +147,15 @@ DEFAULT_CONFIG = {
     # accessor call. Only affects `dataset: scm` (SCMMolecularDataset /
     # CombinedSCMMolecularDataset). CLI: --keep_in_memory.
     "keep_in_memory": False,
+    # Optional surrounding-molecule context for `dataset: scm` per-molecule
+    # training. A dict like {"mode": "radius"|"knn"|"all", "radius": 20.0,
+    # "k": 8} (or null / empty to disable). When enabled, each sample's graph
+    # additionally contains the atoms of the query molecule's surrounding
+    # molecules; the model runs a per-molecule readout and the loss covers only
+    # the minibatch (query) molecules. `model.pbc_edge_features` is
+    # auto-enabled so inter-molecular edges use minimum-image displacements.
+    # CLI: --context_mode / --context_radius / --context_k.
+    "context": None,
     "model": {
         "hidden_dim": 128,
         "num_layers": 2,
@@ -280,6 +290,13 @@ FLAG_DEFS = [
         "keep_in_memory",
         dict(action="store_true", default=None),
     ),
+    (
+        "context_mode",
+        "context.mode",
+        dict(choices=["radius", "knn", "all"]),
+    ),
+    ("context_radius", "context.radius", dict(type=float)),
+    ("context_k", "context.k", dict(type=int)),
     ("hidden_dim", "model.hidden_dim", dict(type=int)),
     ("num_layers", "model.num_layers", dict(type=int)),
     ("heads", "model.heads", dict(type=int)),
@@ -421,6 +438,7 @@ def build_dataset(config: dict):
             targets,
             radius=config["radius"],
             keep_in_memory=config.get("keep_in_memory", False),
+            context=config.get("context"),
         )
     return CombinedH5MolecularDataset(data_files, targets, radius=config["radius"])
 
@@ -437,15 +455,23 @@ def _resolve_envelope(name) -> type[AbstractEnvelope] | AbstractEnvelope | None:
     return resolve_envelope(name)
 
 
-def build_model(model_cfg: dict, radius: float | None = None) -> ScalarMoleculeModel:
+def build_model(
+    model_cfg: dict, radius: float | None = None, context: dict | None = None
+) -> ScalarMoleculeModel:
     """Build a ScalarMoleculeModel from a config dict.
 
     ``model.cutoff_upper`` is optional: when omitted (and not in ``rbf_kwargs``)
     it defaults to ``radius`` (the radius-graph cutoff), so the RBFs and the
     graph stay consistent. Explicit ``rbf_kwargs.cutoff_upper`` entries take
     precedence over the first-class ``cutoff_upper`` knob.
+
+    ``context`` (the top-level ``context:`` config block) auto-enables
+    ``model.pbc_edge_features`` so surrounding-molecule edges use minimum-image
+    displacements; no separate model knob is required.
     """
     model_cfg = dict(model_cfg)
+    if context:
+        model_cfg.setdefault("pbc_edge_features", True)
     conv_class = CONV_REGISTRY[model_cfg.pop("conv_class", "GATConv")]
     heads = model_cfg.pop("heads", None)
     conv_kwargs = dict(model_cfg.pop("conv_kwargs", {}) or {})
@@ -643,6 +669,9 @@ def _make_run_name(config: dict) -> str:
         parts.append(f"rbf{model['num_rbf']}")
     if model.get("use_edge_features"):
         parts.append("edgefeat")
+    ctx = config.get("context")
+    if ctx:
+        parts.append(f"ctx{ctx.get('mode', 'radius')}")
     if training.get("scheduler_class"):
         parts.append(str(training["scheduler_class"]).rsplit(".", 1)[-1])
     parts.append(datetime.now().strftime("%Y%m%d-%H%M%S"))
@@ -1115,17 +1144,51 @@ def restore_best_checkpoint(module, trainer) -> str:
     return best_path
 
 
-def predict(module, loader, group_attr: str = "species_name"):
-    """Return ``(y, y_hat, groups)`` over a loader.
+@overload
+def predict(
+    module,
+    loader,
+    group_attr: str = "species_name",
+) -> tuple[torch.Tensor, torch.Tensor, list[str]]: ...
+
+
+@overload
+def predict(
+    module,
+    loader,
+    group_attr: str = "species_name",
+    *,
+    return_ids: Literal[True],
+) -> tuple[torch.Tensor, torch.Tensor, list[str], list[str]]: ...
+
+
+def predict(
+    module, loader, group_attr: str = "species_name", return_ids: bool = False
+):
+    """Return ``(y, y_hat, groups)`` over a loader (plus ``ids`` when requested).
 
     ``y`` / ``y_hat`` are tensors of shape ``(num_graphs, num_targets)`` (raw
     target units). ``groups`` is a list of per-graph group labels used for
     group-aware R2: the material/species label (``species_name``) when present,
     else the molecule id (``mol_name``), else per-graph indices.
+
+    With ``return_ids=True`` a fourth element ``ids`` is returned: one unique
+    per-graph identifier per sample, in loader order. Each id combines the flat
+    base-dataset index with the collated ``mol_name`` / ``frame`` metadata when
+    available (e.g. ``"12:2-TNATA:37"``), so a prediction can be traced back to
+    the exact source sample (molecule + MD frame) even after a random split.
     """
     module.eval()
     device = next(module.parameters()).device
-    ys, preds, groups = [], [], []
+    ys, preds, groups, ids = [], [], [], []
+    # Map loader order -> flat index into the base dataset, unwrapping any
+    # torch.utils.data.Subset produced by random_split / CV. Used for the id.
+    base, indices = loader.dataset, None
+    while isinstance(base, torch.utils.data.Subset):
+        indices = base.indices
+        base = base.dataset
+    flat_order = indices if indices is not None else list(range(len(loader.dataset)))
+    pos = 0
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
@@ -1135,6 +1198,7 @@ def predict(module, loader, group_attr: str = "species_name"):
             ys.append(batch.y.view_as(y_hat))
             # Un-standardize predictions into the original target units.
             preds.append(module.denormalize_targets(y_hat))
+            n = int(y_hat.shape[0])
             # Per-graph group labels: PyG batches string attrs into a list.
             labels = None
             for attr in (group_attr, "mol_name"):
@@ -1142,9 +1206,70 @@ def predict(module, loader, group_attr: str = "species_name"):
                     labels = [str(g) for g in getattr(batch, attr)]
                     break
             if labels is None:
-                labels = [str(i) for i in range(y_hat.shape[0])]
+                labels = [str(i) for i in range(n)]
             groups.extend(labels)
+            if return_ids:
+                for i in range(n):
+                    parts = [str(flat_order[pos + i])]
+                    if hasattr(batch, "mol_name"):
+                        mol = (
+                            batch.mol_name[i]
+                            if isinstance(batch.mol_name, (list, tuple))
+                            else batch.mol_name
+                        )
+                        parts.append(str(mol))
+                    if hasattr(batch, "frame"):
+                        frame = (
+                            batch.frame[i]
+                            if torch.is_tensor(batch.frame)
+                            else batch.frame
+                        )
+                        parts.append(str(int(frame)))
+                    ids.append(":".join(parts))
+            pos += n
+    if return_ids:
+        return torch.cat(ys), torch.cat(preds), groups, ids
     return torch.cat(ys), torch.cat(preds), groups
+
+
+def save_predictions(
+    outpath: str,
+    ids: Sequence[str],
+    truth: torch.Tensor,
+    pred: torch.Tensor,
+    targets: list[str] | None = None,
+) -> str:
+    """Write per-sample predictions to a CSV: one row per graph.
+
+    Columns: ``id`` (unique per-sample identifier, see :func:`predict`), plus
+    ``truth_<tag>`` / ``pred_<tag>`` for every target (``tag`` is the sanitized
+    target name, or the target index when ``targets`` is omitted). ``truth`` and
+    ``pred`` have shape ``(num_graphs, num_targets)`` in raw target units.
+    Returns ``outpath``.
+    """
+    import csv
+
+    truth = truth.detach().cpu()
+    pred = pred.detach().cpu()
+    n_targets = truth.shape[1]
+    tags = (
+        [sanitize_name(t) for t in targets]
+        if targets
+        else [str(i) for i in range(n_targets)]
+    )
+    columns: list[str] = ["id"]
+    for tag in tags:
+        columns += [f"truth_{tag}", f"pred_{tag}"]
+    with open(outpath, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        for i, sid in enumerate(ids):
+            row = [sid]
+            for j in range(n_targets):
+                row += [f"{truth[i, j].item():.8g}", f"{pred[i, j].item():.8g}"]
+            writer.writerow(row)
+    log.info("[predictions] saved %d row(s) to %s", len(ids), outpath)
+    return outpath
 
 
 def plot_truth_vs_pred(ax, truth, pred, title) -> None:
@@ -1356,7 +1481,11 @@ def _run_cross_validation(config, targets, dataset, outdir) -> None:
             target_mean = target_std = None
             if training.get("normalize_targets", True):
                 target_mean, target_std = fit_target_scaler(train_loader, len(targets))
-            model = build_model(config["model"], radius=config["radius"])
+            model = build_model(
+                config["model"],
+                radius=config["radius"],
+                context=config.get("context"),
+            )
             system = build_module(
                 model,
                 training,
@@ -1386,13 +1515,22 @@ def _run_cross_validation(config, targets, dataset, outdir) -> None:
             # weights that remain in memory after fit).
             restore_best_checkpoint(system, trainer)
 
-            truth, pred, groups = predict(system, val_loader)
+            truth, pred, groups, ids = predict(system, val_loader, return_ids=True)
             metrics = compute_metrics(truth, pred, targets, groups=groups)
             fold_metrics.append((label, metrics))
             plot_path = os.path.join(fold_dir, "truth_vs_pred.png")
             save_truth_vs_pred_figure(
                 [(f"{label} (validation)", truth.view(-1), pred.view(-1))],
                 plot_path,
+            )
+            # Persist the fold's per-sample predictions (with a unique id) next
+            # to its truth-vs-predicted figure, matching the single-split naming.
+            save_predictions(
+                os.path.join(fold_dir, "predictions_validation.csv"),
+                ids,
+                truth,
+                pred,
+                targets,
             )
             log.info(
                 "[cv] fold %-14s MAE=%.4f RMSE=%.4f R2=%.4f n=%d",

@@ -30,11 +30,19 @@ def r2_score(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     y_hat = y_hat.reshape_as(y)
     ss_res = ((y - y_hat) ** 2).sum()
     ss_tot = ((y - y.mean()) ** 2).sum()
-    if ss_tot.item() == 0:
-        return torch.tensor(
-            1.0 if ss_res.item() == 0 else 0.0, device=y.device, dtype=y.dtype
-        )
-    return 1.0 - ss_res / ss_tot
+    # Avoid .item() (forces a GPU->CPU sync); handle degenerate (constant)
+    # targets with pure tensor ops: return 1.0 when predictions are exact and
+    # 0.0 otherwise. torch.where discards the unselected branch, so the NaN
+    # from 0/0 in the fallback never leaks into the result.
+    return torch.where(
+        ss_tot == 0,
+        torch.where(
+            ss_res == 0,
+            torch.ones_like(ss_res),
+            torch.zeros_like(ss_res),
+        ),
+        1.0 - ss_res / ss_tot,
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -157,13 +165,22 @@ class SimpleLightningMoleculeModule(pl.LightningModule):
             data: A ``torch_geometric.data.Batch`` (or ``Data``) providing ``x``
                 (node features / atom types), ``edge_index`` (connectivity),
                 ``batch`` (graph index per node) and, optionally, ``pos`` (node
-                positions, used for geometric edge features).
+                positions, used for geometric edge features). In context mode it
+                also carries ``mol_index`` / ``mol_is_query`` (per-molecule
+                readout) and ``box`` (PBC minimum-image edge features), which are
+                forwarded to the model when present.
 
         Returns:
             Predictions of shape ``(num_graphs, 1)``.
         """
+        kw: dict = {}
+        for attr in ("mol_index", "mol_is_query"):
+            if hasattr(data, attr):
+                kw[attr] = getattr(data, attr)
+        if hasattr(data, "box"):
+            kw["box"] = data.box
         return self.model(
-            data.x, data.edge_index, data.batch, getattr(data, "pos", None)
+            data.x, data.edge_index, data.batch, getattr(data, "pos", None), **kw
         )
 
     def normalize_targets(self, y: torch.Tensor) -> torch.Tensor:

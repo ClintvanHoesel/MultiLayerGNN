@@ -96,6 +96,7 @@ from training_helpers import (  # noqa: E402
     resolve_run_outdir,
     restore_best_checkpoint,
     sanitize_name,
+    save_predictions,
     save_truth_vs_pred_figure,
     set_nested,
     set_seed,
@@ -258,7 +259,11 @@ def main() -> None:
                 target_mean.tolist(),
                 target_std.tolist(),
             )
-        model = build_model(config["model"], radius=config["radius"])
+        model = build_model(
+            config["model"],
+            radius=config["radius"],
+            context=config.get("context"),
+        )
         system = build_module(
             model,
             config["training"],
@@ -301,7 +306,7 @@ def main() -> None:
             ("Validation", val_loader),
             ("Test", test_loader),
         ]:
-            truth, pred, groups = predict(system, loader)
+            truth, pred, groups, ids = predict(system, loader, return_ids=True)
             metrics = compute_metrics(truth, pred, targets, groups=groups)
             log.info(
                 "%10s: MAE=%.4f  RMSE=%.4f  R2(within-group)=%.4f  R2(pooled)=%.4f  n=%d",
@@ -335,6 +340,16 @@ def main() -> None:
                     metrics["r2"],
                 )
             predictions.append((name, truth.view(-1), pred.view(-1)))
+            # Persist per-sample predictions (with a unique id) for the
+            # validation and test splits, next to the truth-vs-predicted figure.
+            if name in ("Validation", "Test"):
+                save_predictions(
+                    os.path.join(outdir, f"predictions_{name.lower()}.csv"),
+                    ids,
+                    truth,
+                    pred,
+                    targets,
+                )
             prefix = name.lower()
             for metric in ("mae", "rmse", "r2"):
                 final_metrics[f"{prefix}_{metric}"] = metrics[metric]
