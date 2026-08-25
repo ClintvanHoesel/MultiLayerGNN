@@ -20,11 +20,11 @@ dataset: scm
 
 # One or more SCM-pure HDF5 files (one periodic box per file).
 data:
-  - data/data_SCM_pure/2-TNATA.hdf5
+  - data/data_SCM_pure/BCP.hdf5
 
 # Target property key(s) within each HDF5 group. UNUSED by the diffusion model
 # (no property conditioning); the SCM dataset is built with target_key=None.
-target: "HOMO"
+target: null
 
 # Radius-graph cutoff (Angstrom) for the PBC neighbor list. REQUIRED — no
 # default: every run must set it manually (here, or with --radius).
@@ -35,7 +35,7 @@ radius: 20.0
 # Keep the SCM HDF5 data resident in memory: load it once at dataset
 # construction instead of re-reading the file on every accessor call. Only
 # affects `dataset: scm` (CombinedSCMMolecularDataset). CLI: --keep_in_memory.
-keep_in_memory: false
+keep_in_memory: true
 
 # CUDA / hardware knobs.
 cuda:
@@ -43,7 +43,7 @@ cuda:
   # "You are using a CUDA device (...) that has Tensor Cores" warning, which
   # otherwise nags on the first matmul. Trades a little float32 precision for
   # a large speedup on GPUs with Tensor Cores (RTX 20xx+). CLI: --tensor_cores.
-  tensor_cores: false
+  tensor_cores: true
 
 model:
   hidden_dim: 128
@@ -120,7 +120,7 @@ sampling:
 
 logging:
   outdir: runs/artifacts_diffusion
-  wandb_project: null
+  wandb_project: diffusion
   run_name: null
   group: null
   tags: null

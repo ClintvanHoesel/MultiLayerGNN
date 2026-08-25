@@ -174,8 +174,8 @@ Config-driven training of an **SE(3)-equivariant diffusion model**
 (`DiffusionMoleculeModel` / `DiffusionMoleculeModule`): an
 epsilon-prediction DDPM denoiser that learns to generate molecular positions
 inside a periodic cell. After training it conditions on a few reference frames,
-generates new conformations, and reports position metrics (coord RMSE, RDF
-mean-abs-diff, min-pair distances) with plots.
+generates new conformations, and reports position metrics (coord RMSE,
+pair-correlation mean-abs-diff, min-pair distances) with plots.
 
 Two dataset layouts (`dataset:` in the config):
 
@@ -227,7 +227,7 @@ With SCM data (few boxes per dataset) the validation/test splits can be empty;
 the runner detects this, falls back to monitoring `train_loss`, and evaluates
 generation on the full dataset. Artifacts land in `logging.outdir/<run name>/`
 (`runs/artifacts_diffusion/` by default, one folder per run): best checkpoint,
-`generation_<split>.png` (truth vs generated RDF + RMSD/min-pair histograms),
+`generation_<split>.png` (truth vs generated pair correlation + RMSD/min-pair histograms),
 `*_generated.npz` (generated structures) and XYZ files for visualization
 (`<split>_sample_<i>.xyz` — for SCM data these are the full reconstructed
 boxes). Use `--wandb-project <name>` to log metrics and plots to W&B; otherwise

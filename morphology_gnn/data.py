@@ -873,6 +873,7 @@ class SCMMolecularDataset(Dataset):
         conformations at generated COM positions.
         """
         if self._cache is not None:
+            assert _normalize_lattice(self._cache["lattice"])[1]
             return {
                 "mol_name": self.mol_name,
                 "lattice": self._cache["lattice"].clone(),
@@ -899,6 +900,7 @@ class SCMMolecularDataset(Dataset):
                 if "position" in group
                 else None
             )
+        assert _normalize_lattice(self.lattice)[1]
         return {
             "mol_name": self.mol_name,
             "lattice": self.lattice.clone(),

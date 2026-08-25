@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch_geometric.nn import GATConv
 
+from ..radius_graph import min_image_disp_batched
 from .embedding import AtomTypeEmbedding, DistanceVectors, ScalarDistanceEmbedding
 from .residual import NORM_REGISTRY, Residual
 
@@ -62,28 +63,6 @@ def resolve_norm_kwargs(residual_kwargs: dict, hidden_dim: int) -> None:
         )
     else:
         residual_kwargs["norm"] = norm_class(hidden_dim, **norm_kwargs)
-
-
-def min_image_disp_batched(
-    pos: torch.Tensor, edge_index: torch.Tensor, box_per_node: torch.Tensor
-) -> torch.Tensor:
-    """Minimum-image displacement vectors for batched edges (orthorhombic cells).
-
-    Args:
-        pos: Node positions, shape ``(N, 3)`` (concatenated over graphs).
-        edge_index: Connectivity, shape ``(2, E)``.
-        box_per_node: Per-node box lengths, shape ``(N, 3)`` (each node carries
-            its graph's box). Edges never cross graphs, so the box of the edge
-            source applies to the whole edge.
-
-    Returns:
-        Displacement vectors of shape ``(E, 3)`` (``pos[dst] - pos[src]`` under
-        the minimum-image convention).
-    """
-    src, dst = edge_index[0], edge_index[1]
-    disp = pos[dst] - pos[src]  # (E, 3)
-    box_e = box_per_node[src]  # (E, 3)
-    return disp - torch.round(disp / box_e) * box_e
 
 
 class TimeEmbedding(nn.Module):

@@ -30,6 +30,8 @@ from morphology_gnn.model.diffusion_model import (
 from morphology_gnn.model.diffusion_trainer import (
     DiffusionMoleculeModule,
     min_pair_dist,
+    pair_correlation,
+    rdf_hist,
 )
 from morphology_gnn.radius_graph import (
     min_image_disp,
@@ -96,6 +98,32 @@ def test_noise_schedule_unknown_kind():
 
 
 # --------------------------------------------------------------------------- #
+# Pair correlation function
+# --------------------------------------------------------------------------- #
+def test_pair_correlation_uses_pbc_shell_and_finite_n_normalization():
+    """One known pair has its exact ideal-gas-normalized shell population."""
+    pos = torch.tensor([[0.2, 5.0, 5.0], [9.2, 5.0, 5.0]])
+    box = torch.tensor([10.0, 10.0, 10.0])
+    g_r, edges = pair_correlation(pos, box, dr=1.0, rmax=5.0)
+
+    # The PBC distance is one Angstrom, therefore its count is in [1, 2).
+    shell_volume = 4.0 * torch.pi / 3.0 * (2.0**3 - 1.0**3)
+    expected_g = box.prod() / shell_volume
+    assert edges.device == pos.device
+    assert torch.allclose(g_r[1], expected_g)
+    assert torch.count_nonzero(g_r) == 1
+
+
+def test_rdf_hist_is_pair_correlation_alias():
+    pos = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    box = torch.tensor([8.0, 8.0, 8.0])
+    actual, actual_edges = rdf_hist(pos, box, dr=0.5)
+    expected, expected_edges = pair_correlation(pos, box, dr=0.5)
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_edges, expected_edges)
+
+
+# --------------------------------------------------------------------------- #
 # PBC helpers
 # --------------------------------------------------------------------------- #
 def brute_force_min_image_disp(pos, edge_index, box):
@@ -138,6 +166,23 @@ def test_min_image_disp_accepts_lattice_matrix():
     d_box = min_image_disp(pos, edge_index, box)
     d_mat = min_image_disp(pos, edge_index, torch.diag(box))
     assert torch.allclose(d_box, d_mat, atol=1e-6)
+
+
+def test_min_image_disp_uses_nearest_image_for_skew_lattice():
+    """Fractional-coordinate rounding alone misses this closer cell image."""
+    lattice = torch.tensor(
+        [[10.0, 0.0, 0.0], [9.0, 1.0, 0.0], [0.0, 0.0, 10.0]]
+    )
+    fractional_disp = torch.tensor([0.49, 0.49, 0.0])
+    pos = torch.stack([torch.zeros(3), fractional_disp @ lattice])
+    edge_index = torch.tensor([[0], [1]])
+
+    disp = min_image_disp(pos, edge_index, lattice)
+
+    # The nearest image is reached by subtracting the second lattice vector,
+    # rather than by independently rounding the fractional coordinates to zero.
+    expected = (fractional_disp @ lattice - lattice[1]).unsqueeze(0)
+    assert torch.allclose(disp, expected)
 
 
 def test_min_image_disp_batched_matches_single():

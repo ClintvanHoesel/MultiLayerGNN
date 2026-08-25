@@ -1,154 +1,196 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
-#include <cmath>
+#include <math_constants.h>
 
-static inline __device__ float minimum_image(float dx, float box)
+namespace
 {
-    return dx - roundf(dx / box) * box;
-}
 
-__global__ void count_edges_kernel(
-    const float *__restrict__ pos,
-    int64_t N,
-    const float *__restrict__ box,
-    float r2,
-    bool loop,
-    int64_t *__restrict__ counts)
-{
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N)
+    constexpr int kThreads = 256;
+
+    __device__ __forceinline__ float minimum_image(float delta, float box)
     {
-        return;
+        return delta - roundf(delta / box) * box;
     }
 
-    const float xi0 = pos[3 * i + 0];
-    const float xi1 = pos[3 * i + 1];
-    const float xi2 = pos[3 * i + 2];
-    int64_t count = 0;
-
-    for (int64_t j = 0; j < N; ++j)
+    __device__ __forceinline__ float pbc_distance2(
+        const float3 xi,
+        const float3 xj,
+        const float box0,
+        const float box1,
+        const float box2)
     {
-        if (i == j && !loop)
+        const float dx = minimum_image(xi.x - xj.x, box0);
+        const float dy = minimum_image(xi.y - xj.y, box1);
+        const float dz = minimum_image(xi.z - xj.z, box2);
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    // One thread owns one source atom. Cooperative tiling lets a block reuse each
+    // target position across all of its source atoms rather than loading it once per
+    // source/target pair from global memory.
+    __global__ void count_edges_kernel(
+        const float3 *__restrict__ pos,
+        int64_t N,
+        const float *__restrict__ box,
+        float r2,
+        bool loop,
+        int64_t *__restrict__ counts)
+    {
+        extern __shared__ float3 target_tile[];
+
+        const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const bool active = i < N;
+        const float3 xi = active ? pos[i] : make_float3(0.0f, 0.0f, 0.0f);
+        const float box0 = box[0];
+        const float box1 = box[1];
+        const float box2 = box[2];
+        int64_t count = 0;
+
+        for (int64_t tile_begin = 0; tile_begin < N; tile_begin += blockDim.x)
         {
-            continue;
-        }
-
-        const float xj0 = pos[3 * j + 0];
-        const float xj1 = pos[3 * j + 1];
-        const float xj2 = pos[3 * j + 2];
-
-        const float dx = minimum_image(xi0 - xj0, box[0]);
-        const float dy = minimum_image(xi1 - xj1, box[1]);
-        const float dz = minimum_image(xi2 - xj2, box[2]);
-        const float dist2 = dx * dx + dy * dy + dz * dz;
-
-        if (dist2 <= r2)
-        {
-            count += 1;
-        }
-    }
-
-    counts[i] = count;
-}
-
-// Writes every valid (distance, neighbor) pair for each node into a flat
-// scratch buffer laid out according to the (full) prefix-sum `starts`.
-__global__ void collect_edges_kernel(
-    const float *__restrict__ pos,
-    int64_t N,
-    const float *__restrict__ box,
-    float r2,
-    bool loop,
-    const int64_t *__restrict__ starts,
-    float *__restrict__ out_dist,
-    int64_t *__restrict__ out_col)
-{
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N)
-    {
-        return;
-    }
-
-    const float xi0 = pos[3 * i + 0];
-    const float xi1 = pos[3 * i + 1];
-    const float xi2 = pos[3 * i + 2];
-    int64_t write_index = starts[i];
-
-    for (int64_t j = 0; j < N; ++j)
-    {
-        if (i == j && !loop)
-        {
-            continue;
-        }
-
-        const float xj0 = pos[3 * j + 0];
-        const float xj1 = pos[3 * j + 1];
-        const float xj2 = pos[3 * j + 2];
-
-        const float dx = minimum_image(xi0 - xj0, box[0]);
-        const float dy = minimum_image(xi1 - xj1, box[1]);
-        const float dz = minimum_image(xi2 - xj2, box[2]);
-        const float dist2 = dx * dx + dy * dy + dz * dz;
-
-        if (dist2 <= r2)
-        {
-            out_dist[write_index] = dist2;
-            out_col[write_index] = j;
-            write_index += 1;
-        }
-    }
-}
-
-// Selects the closest max_k neighbors (by distance) for each node from the
-// collected scratch buffer and writes the final edge_index. If max_k <= 0,
-// every collected neighbor is kept. Ties are broken by scan order.
-__global__ void select_k_edges_kernel(
-    int64_t N,
-    int64_t max_k,
-    const int64_t *__restrict__ full_starts,   // size N + 1
-    const int64_t *__restrict__ capped_starts, // size N
-    const float *__restrict__ in_dist,
-    const int64_t *__restrict__ in_col,
-    unsigned char *__restrict__ chosen, // size total_full
-    int64_t *__restrict__ out_rows,
-    int64_t *__restrict__ out_cols)
-{
-    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N)
-    {
-        return;
-    }
-
-    const int64_t begin = full_starts[i];
-    const int64_t cnt = full_starts[i + 1] - begin;
-    const int64_t k = (max_k > 0 && max_k < cnt) ? max_k : cnt;
-
-    for (int64_t m = 0; m < cnt; ++m)
-    {
-        chosen[begin + m] = 0;
-    }
-
-    int64_t out_pos = capped_starts[i];
-    for (int64_t s = 0; s < k; ++s)
-    {
-        float best = INFINITY;
-        int64_t best_m = -1;
-        for (int64_t m = 0; m < cnt; ++m)
-        {
-            if (!chosen[begin + m] && in_dist[begin + m] < best)
+            const int64_t j = tile_begin + threadIdx.x;
+            if (j < N)
             {
-                best = in_dist[begin + m];
-                best_m = m;
+                target_tile[threadIdx.x] = pos[j];
             }
+            __syncthreads();
+
+            const int64_t remaining = N - tile_begin;
+            const int tile_size = static_cast<int>(
+                remaining < blockDim.x ? remaining : blockDim.x);
+            if (active)
+            {
+                for (int local_j = 0; local_j < tile_size; ++local_j)
+                {
+                    const int64_t global_j = tile_begin + local_j;
+                    if ((loop || i != global_j) &&
+                        pbc_distance2(xi, target_tile[local_j], box0, box1, box2) <= r2)
+                    {
+                        ++count;
+                    }
+                }
+            }
+            __syncthreads();
         }
-        // best_m is always valid because cnt >= k >= s + 1.
-        chosen[begin + best_m] = 1;
-        out_rows[out_pos + s] = i;
-        out_cols[out_pos + s] = in_col[begin + best_m];
+
+        if (active)
+        {
+            counts[i] = count;
+        }
     }
-}
+
+    // StoreDistance=true is used when capped-neighbor selection needs the squared
+    // distances. The unrestricted path writes edge_index directly and therefore
+    // avoids all scratch allocations and the selection kernel.
+    template <bool StoreDistance>
+    __global__ void collect_edges_kernel(
+        const float3 *__restrict__ pos,
+        int64_t N,
+        const float *__restrict__ box,
+        float r2,
+        bool loop,
+        const int64_t *__restrict__ starts,
+        float *__restrict__ out_dist,
+        int64_t *__restrict__ out_rows,
+        int64_t *__restrict__ out_cols)
+    {
+        extern __shared__ float3 target_tile[];
+
+        const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const bool active = i < N;
+        const float3 xi = active ? pos[i] : make_float3(0.0f, 0.0f, 0.0f);
+        const float box0 = box[0];
+        const float box1 = box[1];
+        const float box2 = box[2];
+        int64_t write_index = active ? starts[i] : 0;
+
+        for (int64_t tile_begin = 0; tile_begin < N; tile_begin += blockDim.x)
+        {
+            const int64_t j = tile_begin + threadIdx.x;
+            if (j < N)
+            {
+                target_tile[threadIdx.x] = pos[j];
+            }
+            __syncthreads();
+
+            const int64_t remaining = N - tile_begin;
+            const int tile_size = static_cast<int>(
+                remaining < blockDim.x ? remaining : blockDim.x);
+            if (active)
+            {
+                for (int local_j = 0; local_j < tile_size; ++local_j)
+                {
+                    const int64_t global_j = tile_begin + local_j;
+                    const float dist2 = pbc_distance2(
+                        xi, target_tile[local_j], box0, box1, box2);
+                    if ((loop || i != global_j) && dist2 <= r2)
+                    {
+                        if constexpr (StoreDistance)
+                        {
+                            out_dist[write_index] = dist2;
+                        }
+                        else
+                        {
+                            out_rows[write_index] = i;
+                        }
+                        out_cols[write_index++] = global_j;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // Selects the closest max_k neighbors for each source atom. This runs only on
+    // the capped path; the common unlimited path bypasses it entirely.
+    __global__ void select_k_edges_kernel(
+        int64_t N,
+        int64_t max_k,
+        const int64_t *__restrict__ full_starts,
+        const int64_t *__restrict__ capped_starts,
+        const float *__restrict__ in_dist,
+        const int64_t *__restrict__ in_col,
+        unsigned char *__restrict__ chosen,
+        int64_t *__restrict__ out_rows,
+        int64_t *__restrict__ out_cols)
+    {
+        const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (i >= N)
+        {
+            return;
+        }
+
+        const int64_t begin = full_starts[i];
+        const int64_t count = full_starts[i + 1] - begin;
+        const int64_t k = max_k < count ? max_k : count;
+        int64_t out_pos = capped_starts[i];
+
+        for (int64_t m = 0; m < count; ++m)
+        {
+            chosen[begin + m] = 0;
+        }
+
+        for (int64_t selected = 0; selected < k; ++selected)
+        {
+            float best_distance = CUDART_INF_F;
+            int64_t best_offset = -1;
+            for (int64_t m = 0; m < count; ++m)
+            {
+                if (!chosen[begin + m] && in_dist[begin + m] < best_distance)
+                {
+                    best_distance = in_dist[begin + m];
+                    best_offset = m;
+                }
+            }
+            chosen[begin + best_offset] = 1;
+            out_rows[out_pos] = i;
+            out_cols[out_pos++] = in_col[begin + best_offset];
+        }
+    }
+
+} // namespace
 
 torch::Tensor radius_graph_pbc_cuda(
     torch::Tensor pos,
@@ -159,90 +201,102 @@ torch::Tensor radius_graph_pbc_cuda(
 {
     TORCH_CHECK(pos.is_cuda(), "pos must be a CUDA tensor");
     TORCH_CHECK(lattice.is_cuda(), "lattice must be a CUDA tensor");
+    TORCH_CHECK(pos.scalar_type() == torch::kFloat32, "pos must have dtype float32");
+    TORCH_CHECK(lattice.scalar_type() == torch::kFloat32, "lattice must have dtype float32");
+    TORCH_CHECK(pos.is_contiguous(), "pos must be contiguous");
+    TORCH_CHECK(lattice.is_contiguous(), "lattice must be contiguous");
+    TORCH_CHECK(pos.device() == lattice.device(), "pos and lattice must share a CUDA device");
     TORCH_CHECK(pos.dim() == 2 && pos.size(1) == 3, "pos must have shape (N, 3)");
     TORCH_CHECK(lattice.dim() == 1 && lattice.size(0) == 3, "lattice must have shape (3,)");
 
-    int64_t N = pos.size(0);
-    float r2 = static_cast<float>(r * r);
+    const int64_t N = pos.size(0);
+    const auto index_options = torch::dtype(torch::kInt64).device(pos.device());
+    if (N == 0)
+    {
+        return torch::empty({2, 0}, index_options);
+    }
 
-    auto counts = torch::empty({N}, torch::dtype(torch::kInt64).device(pos.device()));
-    const int threads = 128;
-    const int blocks = static_cast<int>((N + threads - 1) / threads);
+    const float r2 = static_cast<float>(r * r);
+    const int blocks = static_cast<int>((N + kThreads - 1) / kThreads);
+    const size_t shared_bytes = kThreads * sizeof(float3);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    const auto pos_ptr = reinterpret_cast<const float3 *>(pos.data_ptr<float>());
+    const auto box_ptr = lattice.data_ptr<float>();
 
-    // Launch every kernel on the torch *current* stream so the raw kernels and
-    // the torch ops below (cumsum / .item) are strictly ordered on one stream —
-    // no explicit device synchronisations are needed and no CPU copies happen.
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto counts = torch::empty({N}, index_options);
+    count_edges_kernel<<<blocks, kThreads, shared_bytes, stream.stream()>>>(
+        pos_ptr, N, box_ptr, r2, loop, counts.data_ptr<int64_t>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    count_edges_kernel<<<blocks, threads, 0, stream.stream()>>>(
-        pos.data_ptr<float>(),
+    auto full_cum = torch::cumsum(counts, 0);
+    auto full_starts = torch::cat({torch::zeros({1}, index_options), full_cum});
+
+    // With no cap, counts already provide the exact output layout. Write the
+    // final edge index directly instead of materialising distances, columns and
+    // a per-edge selection mask.
+    if (max_num_neighbors <= 0)
+    {
+        const int64_t total_full = full_cum[N - 1].item<int64_t>();
+        auto edge_index = torch::empty({2, total_full}, index_options);
+        if (total_full > 0)
+        {
+            collect_edges_kernel<false><<<blocks, kThreads, shared_bytes, stream.stream()>>>(
+                pos_ptr,
+                N,
+                box_ptr,
+                r2,
+                loop,
+                full_starts.data_ptr<int64_t>(),
+                nullptr,
+                edge_index[0].data_ptr<int64_t>(),
+                edge_index[1].data_ptr<int64_t>());
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+        return edge_index;
+    }
+
+    auto capped_counts = torch::clamp_max(counts, max_num_neighbors);
+    auto capped_cum = torch::cumsum(capped_counts, 0);
+    auto capped_starts = torch::cat(
+        {torch::zeros({1}, index_options), capped_cum.narrow(0, 0, N - 1)});
+    // Both output sizes are needed on the host. Transfer them together so the
+    // capped path has a single host/device synchronization point.
+    auto totals_cpu = torch::stack({full_cum[N - 1], capped_cum[N - 1]}).cpu();
+    const int64_t total_full = totals_cpu[0].item<int64_t>();
+    const int64_t total_out = totals_cpu[1].item<int64_t>();
+    auto edge_index = torch::empty({2, total_out}, index_options);
+
+    if (total_full == 0)
+    {
+        return edge_index;
+    }
+
+    auto scratch_dist = torch::empty({total_full}, pos.options());
+    auto scratch_col = torch::empty({total_full}, index_options);
+    auto chosen = torch::empty(
+        {total_full}, torch::dtype(torch::kUInt8).device(pos.device()));
+    collect_edges_kernel<true><<<blocks, kThreads, shared_bytes, stream.stream()>>>(
+        pos_ptr,
         N,
-        lattice.data_ptr<float>(),
+        box_ptr,
         r2,
         loop,
-        counts.data_ptr<int64_t>());
-    // No device->host copy of `counts` and no explicit synchronisation: the
-    // prefix sums below run on the GPU on the same stream (so they serialise
-    // after the count kernel), and the only host sync is the single scalar
-    // .item() used to size the output tensor.
-
-    // Per-node output degree: capped at max_num_neighbors when requested.
-    torch::Tensor capped_counts = counts;
-    if (max_num_neighbors > 0)
-    {
-        auto cap = torch::full({N}, static_cast<int64_t>(max_num_neighbors),
-                               torch::dtype(torch::kInt64).device(pos.device()));
-        capped_counts = torch::minimum(counts, cap);
-    }
-
-    // Inclusive prefix sums on the GPU; shift right by one to get the exclusive
-    // starts used by the collect/select kernels.
-    auto full_cum = torch::cumsum(counts, 0);       // (N,)  = [c0, c0+c1, ...]
-    auto capped_cum = torch::cumsum(capped_counts, 0);
-
-    int64_t total_full = 0;
-    int64_t total_out = 0;
-    if (N > 0)
-    {
-        total_full = full_cum[N - 1].item<int64_t>();
-        total_out = capped_cum[N - 1].item<int64_t>();
-    }
-
-    // full_starts has size N+1 (the collect/select kernels read starts[i+1]);
-    // capped_starts has size N.
-    auto opts = torch::dtype(torch::kInt64).device(pos.device());
-    auto full_starts = torch::cat({torch::zeros({1}, opts), full_cum});
-    auto capped_starts = torch::cat(
-        {torch::zeros({1}, opts), capped_cum.narrow(0, 0, N > 0 ? N - 1 : 0)});
-
-    auto edge_index = torch::empty({2, total_out}, torch::dtype(torch::kInt64).device(pos.device()));
-
-    if (total_full > 0)
-    {
-        auto scratch_dist = torch::empty({total_full}, torch::dtype(torch::kFloat32).device(pos.device()));
-        auto scratch_col = torch::empty({total_full}, torch::dtype(torch::kInt64).device(pos.device()));
-        auto chosen = torch::empty({total_full}, torch::dtype(torch::kUInt8).device(pos.device()));
-
-        collect_edges_kernel<<<blocks, threads, 0, stream.stream()>>>(
-            pos.data_ptr<float>(),
-            N,
-            lattice.data_ptr<float>(),
-            r2,
-            loop,
-            full_starts.data_ptr<int64_t>(),
-            scratch_dist.data_ptr<float>(),
-            scratch_col.data_ptr<int64_t>());
-        select_k_edges_kernel<<<blocks, threads, 0, stream.stream()>>>(
-            N,
-            max_num_neighbors,
-            full_starts.data_ptr<int64_t>(),
-            capped_starts.data_ptr<int64_t>(),
-            scratch_dist.data_ptr<float>(),
-            scratch_col.data_ptr<int64_t>(),
-            chosen.data_ptr<unsigned char>(),
-            edge_index[0].data_ptr<int64_t>(),
-            edge_index[1].data_ptr<int64_t>());
-    }
+        full_starts.data_ptr<int64_t>(),
+        scratch_dist.data_ptr<float>(),
+        nullptr,
+        scratch_col.data_ptr<int64_t>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    select_k_edges_kernel<<<blocks, kThreads, 0, stream.stream()>>>(
+        N,
+        max_num_neighbors,
+        full_starts.data_ptr<int64_t>(),
+        capped_starts.data_ptr<int64_t>(),
+        scratch_dist.data_ptr<float>(),
+        scratch_col.data_ptr<int64_t>(),
+        chosen.data_ptr<unsigned char>(),
+        edge_index[0].data_ptr<int64_t>(),
+        edge_index[1].data_ptr<int64_t>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return edge_index;
 }

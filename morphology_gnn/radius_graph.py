@@ -83,7 +83,7 @@ def wrap_pos(pos: torch.Tensor, box: torch.Tensor) -> torch.Tensor:
     Returns:
         Wrapped positions, same shape as ``pos``, each coordinate in ``[0, box)``.
     """
-    return torch.remainder(pos, box.to(pos.dtype))
+    return torch.remainder(pos, box.to(dtype=pos.dtype, device=pos.device))
 
 
 def min_image_disp(
@@ -92,12 +92,11 @@ def min_image_disp(
     """Minimum-image displacement vectors for an edge list under PBC.
 
     For each edge ``(src, dst)`` returns the shortest periodic displacement
-    ``pos[dst] - pos[src]``, computed in fractional coordinates (``round`` the
-    fractional difference so the image lies in the same cell). Correct for both
-    orthorhombic boxes (3-vector or diagonal matrix) and general ``(3, 3)``
-    lattice matrices. Requires the cell to be large enough for the minimum image
-    to be unambiguous (cell > 2 * cutoff, the same assumption as
-    :func:`radius_graph_pbc`).
+    ``pos[dst] - pos[src]``. Orthorhombic cells use the usual component-wise
+    wrapping. For a general lattice, the closest vector is selected from the 27
+    neighbouring periodic images. This is necessary for skew cells: rounding a
+    fractional displacement independently along each lattice vector does not in
+    general select the Euclidean nearest image.
 
     Args:
         pos: Node positions, shape ``(N, 3)``.
@@ -107,18 +106,8 @@ def min_image_disp(
     Returns:
         Displacement vectors of shape ``(E, 3)``.
     """
-    box, is_orthorhombic = _normalize_lattice(lattice)
-    device = pos.device
-    box = box.to(pos.dtype).to(device)
     src, dst = edge_index[0], edge_index[1]
-    disp = pos[dst] - pos[src]  # (E, 3)
-    if is_orthorhombic:
-        return disp - torch.round(disp / box) * box
-    # General lattice: minimum image in fractional coordinates. DOES NOT ALWAYS WORK
-    inv_lattice = torch.linalg.inv(lattice.to(pos.dtype).to(device))
-    frac = disp @ inv_lattice  # (E, 3)
-    frac = frac - torch.round(frac)
-    return frac @ lattice.to(pos.dtype).to(device)
+    return _min_image_delta(pos[dst] - pos[src], lattice)
 
 
 def min_image_disp_batched(
@@ -142,9 +131,7 @@ def min_image_disp_batched(
         the minimum-image convention).
     """
     src, dst = edge_index[0], edge_index[1]
-    disp = pos[dst] - pos[src]  # (E, 3)
-    box_e = box_per_node[src]  # (E, 3)
-    return disp - torch.round(disp / box_e) * box_e
+    return _min_image_delta_orthorhombic(pos[dst] - pos[src], box_per_node[src])
 
 
 def wrap_pos_general(pos: torch.Tensor, lattice: torch.Tensor) -> torch.Tensor:
@@ -161,51 +148,68 @@ def wrap_pos_general(pos: torch.Tensor, lattice: torch.Tensor) -> torch.Tensor:
     return frac @ lattice
 
 
-def _min_image_delta(
-    delta: torch.Tensor,
-    lattice: torch.Tensor,
-    box: torch.Tensor,
-    is_orthorhombic: bool,
+def _min_image_delta_orthorhombic(
+    delta: torch.Tensor, box: torch.Tensor
 ) -> torch.Tensor:
+    """Apply the minimum-image convention to orthorhombic displacements."""
+    box = box.to(dtype=delta.dtype, device=delta.device)
+    return delta - torch.round(delta / box) * box
+
+
+def _min_image_delta(delta: torch.Tensor, lattice: torch.Tensor) -> torch.Tensor:
     """Shortest periodic displacement for a difference vector ``delta``.
 
-    Same minimum-image convention as :func:`min_image_disp`: orthorhombic boxes
-    use the vectorized ``round`` trick, general lattices the fractional-coordinate
-    rounding. The caller decides which path via ``is_orthorhombic`` (from
-    :func:`_normalize_lattice`) so the two are consistent with the rest of the
-    PBC machinery.
+    Orthorhombic cells use component-wise wrapping. For a general cell the
+    closest of the 27 images adjacent to the wrapped displacement is selected.
+    The fractional transform is only used to bring arbitrary input coordinates
+    into one reference cell; it is not used to choose the nearest image.
     """
+    box, is_orthorhombic = _normalize_lattice(lattice)
     if is_orthorhombic:
-        box = box.to(delta.dtype).to(delta.device)
-        return delta - torch.round(delta / box) * box
-    lattice = lattice.to(delta.dtype).to(delta.device)
+        return _min_image_delta_orthorhombic(delta, box)
+
+    lattice = lattice.to(dtype=delta.dtype, device=delta.device)
     inv_lattice = torch.linalg.inv(lattice)
     frac = delta @ inv_lattice
-    frac = frac - torch.round(frac)
-    return frac @ lattice
+    wrapped_delta = (frac - torch.floor(frac)) @ lattice
+
+    image_indices = torch.arange(-1, 2, device=delta.device)
+    image_shifts = (
+        torch.stack(
+            torch.meshgrid(image_indices, image_indices, image_indices, indexing="ij"),
+            dim=-1,
+        )
+        .reshape(-1, 3)
+        .to(dtype=delta.dtype)
+        @ lattice
+    )
+    candidates = wrapped_delta.unsqueeze(-2) - image_shifts
+    closest = candidates.square().sum(dim=-1).argmin(dim=-1)
+    return torch.gather(
+        candidates,
+        dim=-2,
+        index=closest[..., None, None].expand(*closest.shape, 1, 3),
+    ).squeeze(-2)
 
 
-def _unwrap_by_reference(
-    pos: torch.Tensor, lattice: torch.Tensor, box: torch.Tensor, is_orthorhombic: bool
-) -> torch.Tensor:
-    """Minimum-image unwrap of every atom relative to the wrapped geometric centroid.
+def _unwrap_by_reference(pos: torch.Tensor, lattice: torch.Tensor) -> torch.Tensor:
+    """Minimum-image unwrap of every atom relative to an anchor atom.
 
-    The wrapped centroid is a point inside the cell around which the molecule is
-    roughly centered; bringing each atom to the image nearest it "pulls the
-    molecule together" into a contiguous blob. Requires the cell to be larger
-    than the molecule's extent (else the minimum image is ambiguous).
+    Anchoring to an actual atom avoids the wrapped-centroid failure mode: a
+    molecule straddling a cell boundary can have its Cartesian centroid in the
+    middle of the cell, far from every atom. The overall translation is
+    arbitrary, so using the first atom is sufficient. Like every no-connectivity
+    fallback, this requires the molecule to fit within the minimum-image range
+    of the anchor; use bonds when that assumption does not hold.
     """
-    c = pos.mean(dim=0)
-    delta = _min_image_delta(pos - c, lattice, box, is_orthorhombic)
-    return c + delta
+    anchor = pos[0]
+    return anchor + _min_image_delta(pos - anchor, lattice)
 
 
 def _unwrap_by_bonds(
     pos: torch.Tensor,
     bonds: torch.Tensor,
     lattice: torch.Tensor,
-    box: torch.Tensor,
-    is_orthorhombic: bool,
 ) -> torch.Tensor:
     """Unwrap by walking the bond graph: place each atom next to a placed bonded neighbor.
 
@@ -233,7 +237,7 @@ def _unwrap_by_bonds(
             for v in adj[u]:
                 if visited[v]:
                     continue
-                delta = _min_image_delta(pos[v] - out[u], lattice, box, is_orthorhombic)
+                delta = _min_image_delta(pos[v] - out[u], lattice)
                 out[v] = out[u] + delta
                 visited[v] = True
                 stack.append(v)
@@ -252,8 +256,8 @@ def unwrap_molecule(
     list is provided the connectivity graph is walked (:func:`_unwrap_by_bonds`)
     to place every atom next to an already-placed bonded neighbor — the most
     robust path when a molecule spans more than half the cell. Otherwise each
-    atom is brought to the minimum-image position relative to the wrapped
-    geometric centroid (:func:`_unwrap_by_reference`).
+    atom is brought to the minimum-image position relative to the first atom
+    (:func:`_unwrap_by_reference`).
 
     Args:
         pos: Wrapped atom positions, shape ``(N, 3)``.
@@ -267,8 +271,8 @@ def unwrap_molecule(
     """
     pos = pos.float()
     lattice = lattice.to(dtype=pos.dtype, device=pos.device)
-    box, is_orthorhombic = _normalize_lattice(lattice)
-    box = box.to(dtype=pos.dtype, device=pos.device)
+    if pos.numel() == 0:
+        return pos
     if bonds is not None:
         arr = (
             bonds
@@ -276,8 +280,8 @@ def unwrap_molecule(
             else torch.as_tensor(bonds, dtype=torch.long, device=pos.device)
         )
         if arr.numel() > 0:
-            return _unwrap_by_bonds(pos, arr, lattice, box, is_orthorhombic)
-    return _unwrap_by_reference(pos, lattice, box, is_orthorhombic)
+            return _unwrap_by_bonds(pos, arr, lattice)
+    return _unwrap_by_reference(pos, lattice)
 
 
 def pbc_center_of_mass(
@@ -457,59 +461,10 @@ def radius_graph_pbc(
     device = pos.device
     lattice = lattice.to(device)
 
-    box, is_orthorhombic = _normalize_lattice(lattice)
-
-    logger.debug(
-        "radius_graph_pbc n=%d r=%.3f path=%s",
-        N,
-        r,
-        "orthorhombic" if is_orthorhombic else "27-image",
-    )
-
-    if not is_orthorhombic:
-        # General-lattice minimum-image via the 27 periodic images of the cell.
-        # Wrap positions into the unit cell so the +/-1 shifts span the whole
-        # cell (requires a cell larger than 2 * r for the minimum image to be
-        # unambiguous, the same assumption as the orthorhombic path).
-        lattice = lattice.to(pos.dtype)
-        inv_lattice = torch.linalg.inv(lattice)
-        frac = pos @ inv_lattice
-        pos = (frac - torch.floor(frac)) @ lattice
-
-        shifts = (
-            torch.stack(
-                torch.meshgrid(
-                    torch.tensor([-1, 0, 1], device=device),
-                    torch.tensor([-1, 0, 1], device=device),
-                    torch.tensor([-1, 0, 1], device=device),
-                    indexing="ij",
-                ),
-                dim=-1,
-            )
-            .reshape(-1, 3)
-            .to(lattice.dtype)
-        )
-
-        shift_disps = shifts @ lattice  # (27, 3)
-
-        diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # (N, N, 3)
-        dist2 = torch.full((N, N), float("inf"), dtype=pos.dtype, device=device)
-        for s in range(shift_disps.size(0)):
-            d2 = ((diff - shift_disps[s]) ** 2).sum(dim=-1)
-            dist2 = torch.minimum(dist2, d2)
-
-        edge_index = _select_edges_from_dist2(dist2, r, loop, max_num_neighbors)
-        logger.debug("radius_graph_pbc: %d edges (27-image path)", edge_index.shape[1])
-        return edge_index
-
-    # Efficient minimum-image convention for orthorhombic boxes.
-    box = box.to(device)
-    pos = torch.remainder(pos, box)
-
-    diff = pos.unsqueeze(1) - pos.unsqueeze(0)
-    diff = diff - torch.round(diff / box) * box
+    logger.debug("radius_graph_pbc n=%d r=%.3f", N, r)
+    diff = _min_image_delta(pos.unsqueeze(1) - pos.unsqueeze(0), lattice)
     dist2 = (diff * diff).sum(dim=-1)
 
     edge_index = _select_edges_from_dist2(dist2, r, loop, max_num_neighbors)
-    logger.debug("radius_graph_pbc: %d edges (orthorhombic path)", edge_index.shape[1])
+    logger.debug("radius_graph_pbc: %d edges", edge_index.shape[1])
     return edge_index

@@ -4,7 +4,8 @@ Config-driven runner for :class:`DiffusionMoleculeModel` /
 :class:`DiffusionMoleculeModule`: trains an epsilon-prediction DDPM denoiser on
 per-atom coordinates (a molecule conformation inside its periodic cell), then
 generates new conformations conditioned on a few reference frames and reports
-position metrics (coord RMSE, RDF mean-abs-diff, min-pair distances) with plots.
+position metrics (coord RMSE, pair-correlation mean-abs-diff, min-pair
+distances) with plots.
 
 Configuration precedence (lowest to highest):
     built-in defaults < config file (``--config``, default ``runs/config_diffusion.yaml``)
@@ -50,7 +51,7 @@ from morphology_gnn.model.diffusion_trainer import (  # noqa: E402
     DiffusionMoleculeModule,
     coord_rmse,
     min_pair_dist,
-    rdf_hist,
+    pair_correlation,
     rdf_mad,
 )
 from morphology_gnn.radius_graph import unwrap_molecule  # noqa: E402
@@ -601,9 +602,10 @@ def evaluate_generation(module, loader, sampling_cfg: dict, device):
         )  # (n, N, 3)
 
         rms = [coord_rmse(g, truth).item() for g in gen]
-        truth_hist, edges = rdf_hist(truth, cell)
+        truth_hist, edges = pair_correlation(truth, cell)
         rdf_mads = [
-            rdf_mad(h, truth_hist).item() for h, _ in (rdf_hist(g, cell) for g in gen)
+            rdf_mad(h, truth_hist).item()
+            for h, _ in (pair_correlation(g, cell) for g in gen)
         ]
         min_ds = [min_pair_dist(g).item() for g in gen]
 
@@ -642,7 +644,9 @@ def plot_generation_figures(refs, outdir: str, split: str) -> str:
     r = refs[0]
     edges = r["edges"].numpy()
     centers = 0.5 * (edges[:-1] + edges[1:])
-    gen_hists = torch.stack([rdf_hist(g, r["cell"])[0] for g in r["gen"]]).numpy()
+    gen_hists = torch.stack(
+        [pair_correlation(g, r["cell"])[0] for g in r["gen"]]
+    ).numpy()
     truth_hist = r["truth_hist"].numpy()
     mean_g = gen_hists.mean(axis=0)
     std_g = gen_hists.std(axis=0)
@@ -660,8 +664,8 @@ def plot_generation_figures(refs, outdir: str, split: str) -> str:
         label=r"$\pm$ 1 std",
     )
     ax.set_xlabel("r ($\\AA$)")
-    ax.set_ylabel("normalized count")
-    ax.set_title(f"Radial distribution ({split})")
+    ax.set_ylabel(r"$g(r)$")
+    ax.set_title(f"Pair correlation ({split})")
     ax.legend()
 
     ax = axes[1]

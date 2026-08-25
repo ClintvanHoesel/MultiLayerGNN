@@ -11,6 +11,7 @@ import copy
 import json
 import logging
 import os
+import random
 import re
 import warnings
 from typing import Literal, Protocol, Sequence, cast, overload
@@ -50,18 +51,10 @@ from morphology_gnn.data import (
     CombinedSCMMolecularDataset,
 )
 from morphology_gnn.model.envelope import (
-    AbstractEnvelope,
-    CosineEnvelope,
-    PolynomialEnvelope,
     ENVELOPE_REGISTRY,
     resolve_envelope,
 )
-from morphology_gnn.model.rbf import (  # noqa: F401  (re-exported for configs)
-    AbstractRBF,
-    BesselRBF,
-    ChebychevRBF,
-    ExpNormalRBF,
-    GaussianRBF,
+from morphology_gnn.model.rbf import (
     RBF_REGISTRY,
     resolve_rbf_class,
 )
@@ -443,16 +436,7 @@ def build_dataset(config: dict):
     return CombinedH5MolecularDataset(data_files, targets, radius=config["radius"])
 
 
-# --- builders ----------------------------------------------------------------
-def _resolve_envelope(name) -> type[AbstractEnvelope] | AbstractEnvelope | None:
-    """Resolve a config value to an envelope class/instance (``None`` stays ``None``).
-
-    Thin wrapper over :func:`morphology_gnn.model.envelope.resolve_envelope`:
-    accepts an ``AbstractEnvelope`` subclass, an instance, or a registry name
-    from :data:`ENVELOPE_REGISTRY` (e.g. ``"CosineEnvelope"``). Unknown strings
-    raise ``ValueError``.
-    """
-    return resolve_envelope(name)
+_resolve_envelope = resolve_envelope
 
 
 def build_model(
@@ -1162,9 +1146,7 @@ def predict(
 ) -> tuple[torch.Tensor, torch.Tensor, list[str], list[str]]: ...
 
 
-def predict(
-    module, loader, group_attr: str = "species_name", return_ids: bool = False
-):
+def predict(module, loader, group_attr: str = "species_name", return_ids: bool = False):
     """Return ``(y, y_hat, groups)`` over a loader (plus ``ids`` when requested).
 
     ``y`` / ``y_hat`` are tensors of shape ``(num_graphs, num_targets)`` (raw
@@ -1308,6 +1290,9 @@ def save_truth_vs_pred_figure(predictions, outpath: str) -> str:
 def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
 
 
 def configure_cuda(config: dict) -> None:

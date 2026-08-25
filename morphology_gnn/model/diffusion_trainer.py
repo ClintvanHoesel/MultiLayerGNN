@@ -71,29 +71,79 @@ def min_image_pair_distances(pos: torch.Tensor, box: torch.Tensor) -> torch.Tens
     return dist[mask]
 
 
+def pair_correlation(
+    pos: torch.Tensor,
+    box: torch.Tensor,
+    dr: float = 0.1,
+    rmax: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Determine the pair-correlation function ``g(r)`` of one periodic box.
+
+    Every unordered pair of positions is assigned to a radial shell using its
+    minimum-image distance.  The shell population is normalized by the
+    population expected for an ideal gas with the same finite number of
+    particles and cell volume, so a spatially uniform distribution has
+    ``g(r)`` near one (away from sampling noise).
+
+    ``rmax`` defaults to half the shortest cell length.  At or below this range
+    each spherical shell is wholly representable under the minimum-image
+    convention.  Returns ``(g_r, edges)``, where ``edges`` has one more entry
+    than ``g_r`` and is expressed in Angstrom.
+    """
+    if pos.ndim != 2 or pos.shape[-1] != 3:
+        raise ValueError(f"pos must have shape (N, 3), got {tuple(pos.shape)}")
+    if dr <= 0:
+        raise ValueError(f"dr must be positive, got {dr}")
+
+    box = box.to(dtype=pos.dtype, device=pos.device).reshape(-1)
+    if box.numel() != 3 or (box <= 0).any():
+        raise ValueError("box must contain three positive orthorhombic lengths")
+    if rmax is None:
+        rmax = (box.min() / 2).item()
+    if rmax <= 0:
+        raise ValueError(f"rmax must be positive, got {rmax}")
+
+    # Keep the final edge exactly at rmax: expanding the final shell beyond the
+    # requested range would make its ideal-gas normalization inconsistent.
+    nbins = max(int(rmax / dr), 1)
+    edges = torch.linspace(
+        0.0, rmax, nbins + 1, dtype=pos.dtype, device=pos.device
+    )
+    dist = min_image_pair_distances(pos, box)
+    # `torch.histc` does not preserve the input device for all backends.  The
+    # explicit bin assignment also makes the treatment of r == rmax clear:
+    # it belongs in the final shell.
+    bin_width = rmax / nbins
+    bin_idx = torch.floor(dist / bin_width).to(torch.long).clamp(max=nbins - 1)
+    valid = dist <= rmax
+    counts = torch.bincount(bin_idx[valid], minlength=nbins).to(pos.dtype)
+
+    shell_volumes = (4.0 * torch.pi / 3.0) * (edges[1:].pow(3) - edges[:-1].pow(3))
+    n_particles = pos.shape[0]
+    # There are N(N-1)/2 unordered pairs in a finite box.  This normalization
+    # avoids the small-N bias of the common large-system rho*N/2 expression.
+    expected = (
+        n_particles * max(n_particles - 1, 0) / 2.0 * shell_volumes / box.prod()
+    )
+    return torch.where(expected > 0, counts / expected, torch.zeros_like(counts)), edges
+
+
 def rdf_hist(
     pos: torch.Tensor,
     box: torch.Tensor,
     dr: float = 0.1,
     rmax: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Normalized radial-distribution histogram of one structure.
+    """Backward-compatible alias for :func:`pair_correlation`.
 
-    Bins the all-pairs minimum-image distances over ``[0, rmax]``. ``rmax``
-    defaults to half the smallest box dimension — the largest range for which
-    the minimum-image convention is unambiguous.
+    Despite its historical name, the returned values are now the physically
+    normalized radial distribution / pair-correlation function ``g(r)``.
     """
-    dist = min_image_pair_distances(pos, box)
-    if rmax is None:
-        rmax = (box.to(pos.dtype).min() / 2).item()
-    nbins = max(int(rmax / dr), 1)
-    hist = torch.histc(dist, bins=nbins, min=0.0, max=rmax)
-    edges = torch.linspace(0.0, rmax, nbins + 1)
-    return hist / hist.sum().clamp_min(1.0), edges
+    return pair_correlation(pos, box, dr=dr, rmax=rmax)
 
 
 def rdf_mad(hist_a: torch.Tensor, hist_b: torch.Tensor) -> torch.Tensor:
-    """Mean absolute difference between two normalized RDF histograms."""
+    """Mean absolute difference between two pair-correlation functions."""
     return (hist_a - hist_b).abs().mean()
 
 
