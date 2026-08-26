@@ -250,9 +250,9 @@ def test_context_affects_query_prediction(tmp_path):
             b_base.x, b_base.edge_index, b_base.batch, b_base.pos, box=b_base.box
         )
     assert out_ctx.shape == (1, 1) and out_base.shape == (1, 1)
-    assert not torch.allclose(out_ctx, out_base, atol=1e-6), (
-        "surrounding-molecule context should change the query prediction"
-    )
+    assert not torch.allclose(
+        out_ctx, out_base, atol=1e-6
+    ), "surrounding-molecule context should change the query prediction"
 
 
 def test_min_image_disp_batched():
