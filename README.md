@@ -1,5 +1,7 @@
 # MultiLayerGNN
 
+THIS REPOSITORY IS A WORK IN PROGRESS.
+
 This repository contains my work on a graph neural network that bridges
 molecular and morphology length scales. I am interested in the range from a
 few nanometres (roughly 10³ molecules) to hundreds of nanometres (up to around
