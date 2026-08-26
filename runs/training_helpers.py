@@ -208,9 +208,17 @@ DEFAULT_CONFIG = {
         "scheduler_kwargs": {},
         "scheduler_monitor": "val_loss",
         "scheduler_interval": "epoch",
+        # Free-form PyTorch Lightning Trainer kwargs (anything pl.Trainer
+        # accepts), e.g. accumulate_grad_batches, precision, overfit_batches,
+        # limit_train_batches, num_sanity_val_steps... Passed straight to
+        # pl.Trainer(**trainer_kwargs(training)). Deep CLI overrides work per
+        # key: --training.trainer_kwargs.accumulate_grad_batches 4.
+        "trainer_kwargs": {},
         # Gradient clipping (PyTorch Lightning Trainer kwargs): maximum allowed
         # gradient norm/value. 0 or None disables clipping. algorithm: "norm"
         # (default, clip by global norm) or "value" (clip each grad by value).
+        # Folded into `trainer_kwargs` at Trainer build time; setting the same
+        # key under `trainer_kwargs` takes precedence.
         "gradient_clip_val": None,
         "gradient_clip_algorithm": "norm",
         # Cross-validation: k_folds > 1 runs K-fold CV instead of the single
@@ -548,7 +556,7 @@ def build_hierarchical_model(
 
     ``context`` (the top-level ``context:`` config block) auto-enables
     ``model.pbc_edge_features`` (as in :func:`build_model`). Hierarchical
-    training requires a per-node molecule assignment (``mol_index``), which the
+    training requires a per-node molecule assignment (``mol_number``), which the
     box context mode provides; enable the top-level ``context:`` block.
     """
     model_cfg = dict(model_cfg)
@@ -916,21 +924,29 @@ def build_logger(config: dict, run_name_suffix: str = "", run_name: str | None =
     return CSVLogger(save_dir=logging_cfg.get("outdir", "runs/artifacts"), name="csv")
 
 
-def gradient_clip_kwargs(config: dict) -> dict:
-    """PyTorch Lightning Trainer kwargs for gradient clipping.
+def trainer_kwargs(config: dict) -> dict:
+    """PyTorch Lightning Trainer kwargs for a training config section.
 
-    Returns ``{}`` when clipping is disabled (``gradient_clip_val`` falsy/None),
-    else ``{"gradient_clip_val": ..., "gradient_clip_algorithm": ...}`` — pass
-    straight to ``pl.Trainer(**gradient_clip_kwargs(train_cfg))``. algorithm is
-    ``"norm"`` (default, global-norm clip) or ``"value"`` (per-param clip).
+    Returns the free-form ``training.trainer_kwargs`` mapping — any accepted
+    ``pl.Trainer`` kwarg (``accumulate_grad_batches``, ``precision``,
+    ``limit_train_batches``, ``overfit_batches``, ...) — ready to pass straight
+    to ``pl.Trainer(**trainer_kwargs(train_cfg))``.
+
+    Gradient clipping lives in the same framework for backwards compatibility:
+    the first-class ``gradient_clip_val`` / ``gradient_clip_algorithm`` keys are
+    folded in (only when ``gradient_clip_val`` is truthy; algorithm defaults to
+    ``"norm"``, i.e. global-norm clip, or ``"value"`` for per-param clip). Any
+    ``gradient_clip_*`` key set explicitly under ``trainer_kwargs`` takes
+    precedence over the corresponding first-class key.
     """
+    kwargs = dict(config.get("trainer_kwargs") or {})
     val = config.get("gradient_clip_val")
-    if not val:
-        return {}
-    return {
-        "gradient_clip_val": float(val),
-        "gradient_clip_algorithm": config.get("gradient_clip_algorithm", "norm"),
-    }
+    if val:
+        kwargs.setdefault("gradient_clip_val", float(val))
+        kwargs.setdefault(
+            "gradient_clip_algorithm", config.get("gradient_clip_algorithm", "norm")
+        )
+    return kwargs
 
 
 def build_callbacks(
@@ -1570,7 +1586,7 @@ def _run_cross_validation(config, targets, dataset, outdir) -> None:
                 accelerator=training["accelerator"],
                 devices=1,
                 log_every_n_steps=10,
-                **gradient_clip_kwargs(training),
+                **trainer_kwargs(training),
                 callbacks=build_callbacks(
                     config,
                     os.path.join(fold_dir, "checkpoints"),

@@ -73,7 +73,7 @@ from run_training import (  # noqa: E402
     build_loaders,
     build_profiler,
     coerce,
-    gradient_clip_kwargs,
+    trainer_kwargs,
     configure_cuda,
     deep_merge,
     load_config,
@@ -138,9 +138,17 @@ DEFAULT_CONFIG = {
         "scheduler_kwargs": {},
         "scheduler_monitor": "val_loss",
         "scheduler_interval": "epoch",
+        # Free-form PyTorch Lightning Trainer kwargs (anything pl.Trainer
+        # accepts), e.g. accumulate_grad_batches, precision, overfit_batches,
+        # limit_train_batches, num_sanity_val_steps... Passed straight to
+        # pl.Trainer(**trainer_kwargs(training)). Deep CLI overrides work per
+        # key: --training.trainer_kwargs.accumulate_grad_batches 4.
+        "trainer_kwargs": {},
         # Gradient clipping (PyTorch Lightning Trainer kwargs): maximum allowed
         # gradient norm/value. 0 or None disables clipping. algorithm: "norm"
-        # (default, global-norm clip) or "value" (per-param clip).
+        # (default, global-norm clip) or "value" (per-param clip). Folded into
+        # `trainer_kwargs` at Trainer build time; setting the same key under
+        # `trainer_kwargs` takes precedence.
         "gradient_clip_val": None,
         "gradient_clip_algorithm": "norm",
     },
@@ -772,7 +780,7 @@ def main() -> None:
             accelerator=config["training"]["accelerator"],
             devices=1,
             log_every_n_steps=10,
-            **gradient_clip_kwargs(config["training"]),
+            **trainer_kwargs(config["training"]),
             callbacks=callbacks,
             profiler=build_profiler(config, outdir),
             logger=logger,

@@ -24,9 +24,9 @@ Each :class:`HierarchicalBlock` performs one full cycle::
 and the whole cycle is repeated ``num_hierarchical_layers`` times with
 *independent* blocks per cycle (each block has its own weights).
 
-Molecular identity is taken from the per-node ``mol_index`` tensor already
+Molecular identity is taken from the per-node ``mol_number`` tensor already
 produced by the box context-mode dataset (``BoxMolecularDataset(context=...)``).
-After PyG batching ``mol_index`` is treated as an *opaque* grouping key (PyG
+After PyG batching ``mol_number`` is treated as an *opaque* grouping key (PyG
 offsets any ``*index`` node attribute by per-sample node counts), so it is
 re-indexed into contiguous, batch-unique ids inside ``forward``.
 
@@ -149,7 +149,7 @@ class AtomToCOM(nn.Module):
 
 def filter_intra_molecular_edges(
     edge_index: torch.Tensor,
-    mol_index: torch.Tensor,
+    mol_number: torch.Tensor,
 ) -> torch.Tensor:
     """Keep only atomistic edges whose endpoints belong to the same molecule.
 
@@ -160,13 +160,13 @@ def filter_intra_molecular_edges(
 
     Args:
         edge_index: Atomistic connectivity, shape ``(2, E)``.
-        mol_index: Molecule id per node, shape ``(N,)``.
+        mol_number: Molecule id per node, shape ``(N,)``.
 
     Returns:
         The intra-molecular subset of ``edge_index``, shape ``(2, E_intra)``.
     """
     src, dst = edge_index
-    keep = mol_index[src] == mol_index[dst]
+    keep = mol_number[src] == mol_number[dst]
     return edge_index[:, keep]
 
 
@@ -568,8 +568,8 @@ class HierarchicalMoleculeModel(nn.Module):
       molecule of each sample (a fully-connected COM graph, so all molecules in
       a large vicinity participate in COM–COM interactions).
 
-    The hierarchical path requires a per-node molecule assignment (``mol_index``)
-    and node positions ``pos``; when ``mol_index`` is not provided each graph is
+    The hierarchical path requires a per-node molecule assignment (``mol_number``)
+    and node positions ``pos``; when ``mol_number`` is not provided each graph is
     treated as a single molecule (graceful degradation). COM positions are
     computed in-model, mass-weighted and PBC-unwrapped (reusing
     :func:`~morphology_gnn.radius_graph.pbc_center_of_mass`), so the dataset does
@@ -932,7 +932,7 @@ class HierarchicalMoleculeModel(nn.Module):
         pred = self.lin2(x)  # (M, num_targets)
         if mol_is_query is None:
             raise ValueError(
-                "mol_is_query is required when mol_index is given (context "
+                "mol_is_query is required when mol_number is given (context "
                 "mode); mark which atoms belong to the query molecule(s)"
             )
         query_per_mol = (
@@ -953,7 +953,7 @@ class HierarchicalMoleculeModel(nn.Module):
         edge_index: torch.Tensor,
         batch: torch.Tensor,
         pos: torch.Tensor | None,
-        mol_index: torch.Tensor | None,
+        mol_number: torch.Tensor | None,
         mol_is_query: torch.Tensor | None,
         box: torch.Tensor | None,
     ) -> torch.Tensor:
@@ -975,9 +975,9 @@ class HierarchicalMoleculeModel(nn.Module):
             if i < self.num_layers - 1:
                 x = F.dropout(x, p=self.dropout, training=self.training)
 
-        if mol_index is not None:
-            mol_stride = int(mol_index.max().item()) + 1
-            mol_key = mol_index + batch * mol_stride  # unique (sample, molecule)
+        if mol_number is not None:
+            mol_stride = int(mol_number.max().item()) + 1
+            mol_key = mol_number + batch * mol_stride  # unique (sample, molecule)
             x = self.global_aggr(x, mol_key)  # (total_mol, hidden_dim)
             x = F.dropout(x, p=self.dropout, training=self.training)
             # Same two-layer prediction head as the graph-level path below.
@@ -986,7 +986,7 @@ class HierarchicalMoleculeModel(nn.Module):
             pred = self.lin2(x)  # (total_mol, num_targets)
             if mol_is_query is None:
                 raise ValueError(
-                    "mol_is_query is required when mol_index is given (context "
+                    "mol_is_query is required when mol_number is given (context "
                     "mode); mark which atoms belong to the query molecule(s)"
                 )
             query_per_mol = (
@@ -1012,7 +1012,7 @@ class HierarchicalMoleculeModel(nn.Module):
         edge_index: torch.Tensor,
         batch: torch.Tensor,
         pos: torch.Tensor | None,
-        mol_index: torch.Tensor | None,
+        mol_number: torch.Tensor | None,
         mol_is_query: torch.Tensor | None,
         box: torch.Tensor | None,
     ) -> torch.Tensor:
@@ -1022,12 +1022,12 @@ class HierarchicalMoleculeModel(nn.Module):
                 "hierarchical mode requires `pos` (node positions) to be "
                 "passed to forward (used to compute the COM positions)"
             )
-        # Molecular grouping: use the existing per-node `mol_index` when given
+        # Molecular grouping: use the existing per-node `mol_number` when given
         # (box context mode), otherwise treat each graph as a single molecule.
-        per_molecule = mol_index is not None
-        if mol_index is None:
-            mol_index = batch
-        mol_index = mol_index.long()
+        per_molecule = mol_number is not None
+        if mol_number is None:
+            mol_number = batch
+        mol_number = mol_number.long()
         batch = batch.long()
 
         # Separate inter-molecular channel: the atomistic graph is restricted to
@@ -1035,13 +1035,13 @@ class HierarchicalMoleculeModel(nn.Module):
         # atom level; all cross-molecule communication goes through the COM level
         # (COM–COM graph). ``atomistic_edges="all"`` keeps the original graph.
         if self.atomistic_edges == "intra":
-            edge_index = filter_intra_molecular_edges(edge_index, mol_index)
+            edge_index = filter_intra_molecular_edges(edge_index, mol_number)
 
         h = self.atom_emb(x)  # (N, hidden_dim)
         edge_attr = self._atomistic_edge_attr(pos, edge_index, batch, box)
         # Opaque, batch-unique grouping key (survives PyG collate offsets).
-        mol_stride = int(mol_index.max().item()) + 1
-        mol_key = mol_index + batch * mol_stride
+        mol_stride = int(mol_number.max().item()) + 1
+        mol_key = mol_number + batch * mol_stride
         # Contiguous per-(graph, molecule) ids 0..M-1: the *inverse* maps each
         # atom to its molecule, `M` is the number of distinct molecules.
         _mol_unique, atom_mol = torch.unique(mol_key, return_inverse=True)
@@ -1086,7 +1086,7 @@ class HierarchicalMoleculeModel(nn.Module):
         edge_index: torch.Tensor,
         batch: torch.Tensor,
         pos: torch.Tensor | None = None,
-        mol_index: torch.Tensor | None = None,
+        mol_number: torch.Tensor | None = None,
         mol_is_query: torch.Tensor | None = None,
         box: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -1098,7 +1098,7 @@ class HierarchicalMoleculeModel(nn.Module):
             batch: ``(N,)`` graph index per node.
             pos: Optional ``(N, 3)`` node positions (required with
                 ``use_edge_features`` and in hierarchical mode).
-            mol_index: Optional ``(N,)`` molecule id per node (context mode).
+            mol_number: Optional ``(N,)`` molecule id per node (context mode).
             mol_is_query: Optional ``(N,)`` boolean mask marking the query
                 molecule's atoms (context mode).
             box: Optional ``(B, 3)`` per-graph box lengths (required with
@@ -1119,8 +1119,8 @@ class HierarchicalMoleculeModel(nn.Module):
             )
         if not self.use_hierarchical:
             return self._forward_atomistic(
-                x, edge_index, batch, pos, mol_index, mol_is_query, box
+                x, edge_index, batch, pos, mol_number, mol_is_query, box
             )
         return self._forward_hierarchical(
-            x, edge_index, batch, pos, mol_index, mol_is_query, box
+            x, edge_index, batch, pos, mol_number, mol_is_query, box
         )

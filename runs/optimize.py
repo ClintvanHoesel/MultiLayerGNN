@@ -70,7 +70,7 @@ from run_training import (  # noqa: E402  (sys.path fix above)
     configure_cuda,
     deep_merge,
     fit_target_scaler,
-    gradient_clip_kwargs,
+    trainer_kwargs,
     load_config,
     normalize_targets,
     require_radius,
@@ -336,7 +336,7 @@ def _make_objective(base_config, search_space, args, study_name):
             enable_checkpointing=False,
             enable_progress_bar=not args.no_progress_bar,
             log_every_n_steps=10,
-            **gradient_clip_kwargs(trial_config["training"]),
+            **trainer_kwargs(trial_config["training"]),
             callbacks=callbacks,
         )
         try:

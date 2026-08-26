@@ -493,7 +493,7 @@ class BoxMolecularDataset(Dataset):
                 When set, every sample's graph additionally contains the atoms
                 of the query molecule's surrounding molecules (radius
                 neighbours / k nearest / the whole box). Node-level
-                ``mol_index`` (query = 0) and ``mol_is_query`` (bool) mark the
+                ``mol_number`` (query = 0) and ``mol_is_query`` (bool) mark the
                 query vs context atoms, while ``y`` and the per-molecule
                 metadata always describe the query molecule, so only the query
                 molecule of each sample is ever trained on.
@@ -686,7 +686,7 @@ class BoxMolecularDataset(Dataset):
             }
             for field in ("IP", "EA", "HOMO", "LUMO", "HOMO-1", "LUMO-1"):
                 path = f"energy/{field}"
-                row[f"transition_dipole_{field}"] = (
+                row[f"energy_{field}"] = (
                     torch.tensor(hf[path][idx], dtype=torch.float)
                     if path in hf
                     else None
@@ -991,10 +991,10 @@ class BoxMolecularDataset(Dataset):
     def _build_context_graph(self, idx: int, row: dict):
         """Concatenate the query molecule's atoms with its context molecules'.
 
-        Returns ``(pos, types, n_per, mol_index, mol_is_query)``:
+        Returns ``(pos, types, n_per, mol_number, mol_is_query)``:
         ``pos`` ``(N, 3)`` box-frame coordinates of every included atom,
         ``types`` ``(N,)`` atomic numbers, ``n_per`` the number of atoms per
-        molecule (query first), ``mol_index`` ``(N,)`` the actual molecule id
+        molecule (query first), ``mol_number`` ``(N,)`` the actual molecule id
         each node belongs to (query = ``idx``, context = the neighbour molecule
         indices) and ``mol_is_query`` a boolean mask over nodes that is True
         only for the query molecule's atoms.
@@ -1020,19 +1020,19 @@ class BoxMolecularDataset(Dataset):
         # context block belongs to its neighbour molecule index (the same ``j``
         # as in ``neighbors``).
         mol_ids = [idx] + list(neighbors)
-        mol_index = torch.tensor(mol_ids, dtype=torch.long).repeat_interleave(
+        mol_number = torch.tensor(mol_ids, dtype=torch.long).repeat_interleave(
             torch.tensor(n_per, dtype=torch.long)
         )
         mol_is_query = torch.zeros(pos.shape[0], dtype=torch.bool)
         mol_is_query[: n_per[0]] = True
-        return pos, types, n_per, mol_index, mol_is_query
+        return pos, types, n_per, mol_number, mol_is_query
 
     def __getitem__(self, idx: int) -> Data:
         """Load one molecule's graph + its per-molecule properties.
 
         When ``context`` is configured the returned graph also contains the
         atoms of the query molecule's surrounding molecules (radius neighbours,
-        k-NN, or the whole box). Node-level ``mol_index`` (query = 0) and
+        k-NN, or the whole box). Node-level ``mol_number`` (query = 0) and
         ``mol_is_query`` (bool) mark which atoms belong to the trained query
         molecule vs. the (untrained) context; ``y`` and every per-molecule
         metadata field always describe the query molecule.
@@ -1041,7 +1041,7 @@ class BoxMolecularDataset(Dataset):
         lattice = row["lattice"]
 
         if self._has_context:
-            pos, types, n_per, mol_index, mol_is_query = self._build_context_graph(
+            pos, types, n_per, mol_number, mol_is_query = self._build_context_graph(
                 idx, row
             )
             n_query_atoms = int(n_per[0])
@@ -1055,7 +1055,7 @@ class BoxMolecularDataset(Dataset):
                 [_atomic_number(s) for s in atoms["symbol"]], dtype=torch.long
             )
             n_query_atoms = int(len(types))
-            mol_index = mol_is_query = None
+            mol_number = mol_is_query = None
 
         # Periodic radius graph over all included atoms (query + context), in
         # the shared box frame -- naturally produces intra- and inter-molecular
@@ -1077,8 +1077,8 @@ class BoxMolecularDataset(Dataset):
             data.box = box.reshape(1, 3).clone()
         data.mol_name = str(idx)
         data.n_atoms = n_query_atoms
-        if mol_index is not None:
-            data.mol_index = mol_index
+        if mol_number is not None:
+            data.mol_number = mol_number
             data.mol_is_query = mol_is_query
             data.n_context_atoms = int(pos.shape[0]) - n_query_atoms
             data.n_context_molecules = int(len(n_per)) - 1

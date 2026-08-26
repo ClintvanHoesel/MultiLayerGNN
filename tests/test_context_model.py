@@ -7,7 +7,7 @@ prediction, so surrounding molecules are passed through message passing but
 never trained on. Covers:
 
 * Context datasets: node counts (radius / knn / all modes), node-level
-  ``mol_index`` / ``mol_is_query`` correctness, inter-molecular (cross-molecule)
+  ``mol_number`` / ``mol_is_query`` correctness, inter-molecular (cross-molecule)
   edges, and PyG batching of context samples.
 * ``ScalarMoleculeModel`` per-molecule readout: returns ``(B, T)`` (one query
   row per sample), gradients flow, and surrounding-molecule context actually
@@ -91,8 +91,8 @@ def test_context_all_node_count_and_masking(tmp_path):
     assert d.n_atoms == N_ATOMS  # query molecule
     assert d.n_context_molecules == 5  # every other molecule in the box
     assert d.n_context_atoms == 5 * N_ATOMS
-    # mol_index: query = 0, context = 1..5 ; mol_is_query marks only query atoms
-    assert d.mol_index.unique().tolist() == list(range(6))
+    # mol_number: query = 0, context = 1..5 ; mol_is_query marks only query atoms
+    assert d.mol_number.unique().tolist() == list(range(6))
     assert d.mol_is_query.sum() == N_ATOMS
     assert d.mol_is_query[:N_ATOMS].all()
     assert not d.mol_is_query[N_ATOMS:].any()
@@ -137,8 +137,8 @@ def test_context_cross_molecule_edges(tmp_path):
     )
     d = ds[0]
     src, dst = d.edge_index
-    cross = d.mol_index[src] != d.mol_index[dst]
-    intra = d.mol_index[src] == d.mol_index[dst]
+    cross = d.mol_number[src] != d.mol_number[dst]
+    intra = d.mol_number[src] == d.mol_number[dst]
     assert intra.any(), "expected intra-molecular edges"
     assert cross.any(), "expected inter-molecular (context) edges"
     assert not (src == dst).any(), "no self loops"
@@ -158,7 +158,7 @@ def test_context_batches_and_collates(tmp_path):
     loader = DataLoader(ds, batch_size=4)
     batch = next(iter(loader))
     assert batch.num_graphs == 4
-    assert batch.mol_index.dtype == torch.int64
+    assert batch.mol_number.dtype == torch.int64
     assert batch.mol_is_query.dtype == torch.bool
     assert batch.box.shape == (4, 3)
     assert batch.y.shape[0] == 4
@@ -196,7 +196,7 @@ def test_model_per_molecule_readout_shape_and_backward(tmp_path):
         batch.edge_index,
         batch.batch,
         batch.pos,
-        mol_index=batch.mol_index,
+        mol_number=batch.mol_number,
         mol_is_query=batch.mol_is_query,
         box=batch.box,
     )
@@ -206,7 +206,7 @@ def test_model_per_molecule_readout_shape_and_backward(tmp_path):
     assert model.atom_emb.embedding.weight.grad is not None
 
 
-def test_model_requires_query_mask_with_mol_index(tmp_path):
+def test_model_requires_query_mask_with_mol_number(tmp_path):
     p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
     ds = BoxMolecularDataset(
         p, target_key=None, radius=3.0, keep_in_memory=True, context={"mode": "all"}
@@ -220,7 +220,7 @@ def test_model_requires_query_mask_with_mol_index(tmp_path):
             batch.edge_index,
             batch.batch,
             batch.pos,
-            mol_index=batch.mol_index,
+            mol_number=batch.mol_number,
             mol_is_query=None,
             box=batch.box,
         )
@@ -241,7 +241,7 @@ def test_context_affects_query_prediction(tmp_path):
             b_ctx.edge_index,
             b_ctx.batch,
             b_ctx.pos,
-            mol_index=b_ctx.mol_index,
+            mol_number=b_ctx.mol_number,
             mol_is_query=b_ctx.mol_is_query,
             box=b_ctx.box,
         )

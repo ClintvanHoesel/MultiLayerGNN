@@ -54,9 +54,9 @@ keep_in_memory: true
 #   radius: 20.0   # COM-scale context cutoff for mode=radius
 #   k: 8           # number of neighbours for mode=knn
 # CLI: --context_mode / --context_radius / --context_k
-# context:
-#   mode: knn
-  # radius: 20.0
+context:
+  mode: radius
+  radius: 15.0
   # k: 6
 
 # CUDA / hardware knobs.
@@ -68,7 +68,7 @@ cuda:
   tensor_cores: true
 
 model:
-  hidden_dim: 32
+  hidden_dim: 64
   num_layers: 7
   # Attention heads (only used when conv_class is GATConv).
   heads: 8
@@ -110,7 +110,7 @@ model:
   cutoff_fn: null
   # Extra constructor kwargs for the cutoff envelope (e.g. PolynomialEnvelope
   # `exponent`). model.rbf_kwargs.cutoff_fn_kwargs overrides this.
-  cutoff_fn_kwargs: {}
+  cutoff_fn_kwargs: {accumulate_grad_batches: 8}
   # Whether to wrap each conv layer in a Residual connection.
   use_residual: true
   # Normalization type applied inside the residual wrapper (first-class knob).
@@ -140,9 +140,9 @@ model:
   # Architecture switch: "scalar" (default) builds ScalarMoleculeModel;
   # "hierarchical" builds the two-level atomistic + COM GNN
   # (HierarchicalMoleculeModel). Hierarchical training needs a per-node molecule
-  # assignment (mol_index) — enable the top-level `context:` block — and
+  # assignment (mol_number) — enable the top-level `context:` block — and
   # `dataset: box`. CLI: --model.arch hierarchical
-  # arch: scalar
+  arch: hierarchical
   # Two-level (atomistic + COM) hierarchy knobs (used only when
   # model.arch: hierarchical; all are passed straight to the model). Each of
   # `num_hierarchical_layers` cycles runs the atomistic conv stack, pools atoms
@@ -155,25 +155,25 @@ model:
   # inter-molecular communication goes through the COM–COM graph
   # (`com_graph: radius` = COM neighbours within com_cutoff, or `all` = every
   # molecule of the sample, i.e. all molecules in a large vicinity).
-  #   num_hierarchical_layers: 1   # 0 disables the hierarchy (plain scalar model)
-  #   atomistic_edges: intra       # intra (default) | all
-  #   com_graph: radius            # radius (default, within com_cutoff) | all
-  #   com_cutoff: 20.0             # COM–COM radius cutoff (Angstrom)
-  #   com_aggregation: mean        # mean | sum | attention
-  #   com_hidden_channels: null    # null -> hidden_dim
-  #   com_num_layers: 1            # COM message-passing layers per cycle
-  #   com_gated: true              # gated residual in the COM -> atom step
+  # num_hierarchical_layers: 1   # 0 disables the hierarchy (plain scalar model)
+  atomistic_edges: intra       # intra (default) | all
+  # com_graph: radius            # radius (default, within com_cutoff) | all
+  com_cutoff: 20.0             # COM–COM radius cutoff (Angstrom)
+  # com_aggregation: mean        # mean | sum | attention
+  # com_hidden_channels: null    # null -> hidden_dim
+  # com_num_layers: 1            # COM message-passing layers per cycle
+  # com_gated: true              # gated residual in the COM -> atom step
 
 training:
-  batch_size: 16
-  lr: 0.001
-  weight_decay: 0.0000001
+  batch_size: 1
+  lr: 0.01
+  weight_decay: 0.0001
   max_epochs: 1000
   patience: 50
   val_frac: 0.1
   test_frac: 0.1
   seed: 0
-  num_workers: 2
+  num_workers: 8
   accelerator: auto
   # Optimizer / scheduler names from the runner registries.
   optimizer_class: AdamW
@@ -182,8 +182,16 @@ training:
   scheduler_kwargs: {}
   scheduler_monitor: val_loss
   scheduler_interval: epoch      # "epoch" or "step" (use "step" for OneCycleLR)
-  # Gradient clipping (PyTorch Lightning Trainer kwargs). Set gradient_clip_val
-  # to a positive number (e.g. 1.0) to enable; 0 or null disables it.
+  # Free-form PyTorch Lightning Trainer kwargs (anything pl.Trainer accepts),
+  # e.g. accumulate_grad_batches, precision, overfit_batches,
+  # limit_train_batches, num_sanity_val_steps... Passed straight to
+  # pl.Trainer(**trainer_kwargs(training)). CLI deep overrides work per key:
+  #   --training.trainer_kwargs.accumulate_grad_batches 4
+  trainer_kwargs: {}
+  # Gradient clipping (PyTorch Lightning Trainer kwargs). These are folded into
+  # `trainer_kwargs` at Trainer build time, so the equivalent keys can also be
+  # set there (which takes precedence). Set gradient_clip_val to a positive
+  # number (e.g. 1.0) to enable; 0 or null disables it.
   # gradient_clip_algorithm: "norm" (default, clip by global gradient norm) or
   # "value" (clip each gradient by value). CLI: --gradient_clip_val 1.0
   gradient_clip_val: 4
@@ -214,7 +222,7 @@ logging:
   # Set to a W&B project name to enable W&B logging. When enabled, the run gets
   # a human-friendly auto-generated name from the hyperparameters (see
   # run_training._make_run_name); override it with `run_name` below.
-  wandb_project: HOMO-2TNATA-CHECKS
+  wandb_project: Test
   # Optional W&B niceties:
   run_name: null             # e.g. "gat-h256-l4-r6.0" (auto if null)
   group: HOMO                       # group related runs together in the W&B UI

@@ -13,7 +13,7 @@ Covers:
 * Gradient flow through atoms -> COM -> COM GNN -> atoms: every parameter
   receives a gradient.
 * Backward compatibility: ``num_hierarchical_layers=0`` reproduces
-  ``ScalarMoleculeModel`` exactly; ``mol_index=None`` degrades gracefully.
+  ``ScalarMoleculeModel`` exactly; ``mol_number=None`` degrades gracefully.
 * Mass-weighted, PBC-aware COM positions (hand-computed reference).
 * ``build_model`` config dispatch (``model.arch: hierarchical``).
 """
@@ -248,10 +248,10 @@ def test_build_com_graph_non_pbc():
 
 def test_filter_intra_molecular_edges():
     # 5 atoms; molecules: mol0 = {0, 1}, mol1 = {2, 3, 4}.
-    mol_index = torch.tensor([0, 0, 1, 1, 1])
+    mol_number = torch.tensor([0, 0, 1, 1, 1])
     # (0,1) intra, (2,0) cross, (1,3) cross, (3,4) intra, (4,2) intra.
     edge_index = torch.tensor([[0, 2, 1, 3, 4], [1, 0, 3, 4, 2]])
-    out = filter_intra_molecular_edges(edge_index, mol_index)
+    out = filter_intra_molecular_edges(edge_index, mol_number)
     assert torch.equal(out, torch.tensor([[0, 3, 4], [1, 4, 2]]))
 
 
@@ -290,10 +290,10 @@ def test_com_node_count_equals_number_of_molecules():
     # A full hierarchical forward produces one COM row per (graph, molecule).
     model = _make_hierarchical_model()
     model.eval()
-    pos, x, batch, mol_index, mol_is_query = _make_multi_molecule_tensors()
+    pos, x, batch, mol_number, mol_is_query = _make_multi_molecule_tensors()
     edge_index = radius_graph(pos, r=2.0, loop=False)
     atom_mol = torch.unique(
-        mol_index + batch * (mol_index.max() + 1), return_inverse=True
+        mol_number + batch * (mol_number.max() + 1), return_inverse=True
     )[1]
     M = int(atom_mol.max()) + 1
     com_pos, com_batch = model._compute_com_positions(pos, x, batch, None, atom_mol, M)
@@ -340,7 +340,7 @@ def test_com_to_atom_receives_only_own_molecule():
 def test_hierarchical_model_rotation_and_translation_invariance():
     model = _make_hierarchical_model()
     model.eval()
-    pos, x, batch, mol_index, mol_is_query = _make_multi_molecule_tensors()
+    pos, x, batch, mol_number, mol_is_query = _make_multi_molecule_tensors()
     edge_index = radius_graph(pos, r=2.0, loop=False)
 
     with torch.no_grad():
@@ -349,7 +349,7 @@ def test_hierarchical_model_rotation_and_translation_invariance():
             edge_index,
             batch,
             pos,
-            mol_index=mol_index,
+            mol_number=mol_number,
             mol_is_query=mol_is_query,
             box=None,
         )
@@ -366,7 +366,7 @@ def test_hierarchical_model_rotation_and_translation_invariance():
             edge_index_rt,
             batch,
             pos_rt,
-            mol_index=mol_index,
+            mol_number=mol_number,
             mol_is_query=mol_is_query,
             box=None,
         )
@@ -381,7 +381,7 @@ def test_hierarchical_model_rotation_and_translation_invariance():
             edge_index_t,
             batch,
             pos_t,
-            mol_index=mol_index,
+            mol_number=mol_number,
             mol_is_query=mol_is_query,
             box=None,
         )
@@ -404,7 +404,7 @@ def test_gradient_flow_through_hierarchy(tmp_path):
         batch.edge_index,
         batch.batch,
         batch.pos,
-        mol_index=batch.mol_index,
+        mol_number=batch.mol_number,
         mol_is_query=batch.mol_is_query,
         box=batch.box,
     )
@@ -431,7 +431,7 @@ def test_hierarchical_forward_shapes_on_context_batch(tmp_path):
             batch.edge_index,
             batch.batch,
             batch.pos,
-            mol_index=batch.mol_index,
+            mol_number=batch.mol_number,
             mol_is_query=batch.mol_is_query,
             box=batch.box,
         )
@@ -456,7 +456,7 @@ def test_hierarchical_intra_atomistic_edges_and_com_all(tmp_path):
         batch.edge_index,
         batch.batch,
         batch.pos,
-        mol_index=batch.mol_index,
+        mol_number=batch.mol_number,
         mol_is_query=batch.mol_is_query,
         box=batch.box,
     )
@@ -495,8 +495,8 @@ def test_backward_compat_num_hierarchical_layers_zero(tmp_path):
     assert torch.allclose(y_s, y_h, atol=1e-5)
 
 
-def test_mol_index_none_degrades_to_per_graph(tmp_path):
-    # Per-molecule samples (no context -> no mol_index): hierarchical model runs
+def test_mol_number_none_degrades_to_per_graph(tmp_path):
+    # Per-molecule samples (no context -> no mol_number): hierarchical model runs
     # with each graph treated as one molecule (per-graph readout).
     p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
     ds = BoxMolecularDataset(p, target_key=None, radius=3.0, keep_in_memory=True)

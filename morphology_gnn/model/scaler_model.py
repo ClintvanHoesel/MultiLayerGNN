@@ -238,7 +238,7 @@ class ScalarMoleculeModel(torch.nn.Module):
         edge_index: torch.Tensor,
         batch: torch.Tensor,
         pos: torch.Tensor | None = None,
-        mol_index: torch.Tensor | None = None,
+        mol_number: torch.Tensor | None = None,
         mol_is_query: torch.Tensor | None = None,
         box: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -250,13 +250,13 @@ class ScalarMoleculeModel(torch.nn.Module):
             batch: ``(N,)`` graph index per node.
             pos: Optional ``(N, 3)`` node positions (required with
                 ``use_edge_features``).
-            mol_index: Optional ``(N,)`` molecule id per node (query = 0). When
+            mol_number: Optional ``(N,)`` molecule id per node (query = 0). When
                 given, the model runs a *per-molecule* readout over every
                 molecule in the (query + context) graph and returns only the
                 query molecule's prediction per sample -- surrounding molecules
                 are passed through message passing but never trained on.
             mol_is_query: Optional ``(N,)`` boolean mask, True for the query
-                molecule's atoms. Required together with ``mol_index`` so the
+                molecule's atoms. Required together with ``mol_number`` so the
                 query prediction can be extracted from the per-molecule output.
             box: Optional ``(B, 3)`` per-graph box lengths. Required with
                 ``pbc_edge_features`` (minimum-image edge displacements).
@@ -311,13 +311,13 @@ class ScalarMoleculeModel(torch.nn.Module):
             if i < self.num_layers - 1:
                 x = F.dropout(x, p=self.dropout, training=self.training)
 
-        if mol_index is not None:
+        if mol_number is not None:
             # Per-molecule readout over the whole (query + context) graph: every
             # molecule of the graph is pooled to one vector and mapped through
             # the head, then only the query molecule's row is returned so the
             # loss is computed on the minibatch (query) molecules only.
-            mol_stride = int(mol_index.max().item()) + 1
-            mol_key = mol_index + batch * mol_stride  # unique (sample, molecule)
+            mol_stride = int(mol_number.max().item()) + 1
+            mol_key = mol_number + batch * mol_stride  # unique (sample, molecule)
             x = self.global_aggr(x, mol_key)  # (total_mol, hidden_dim)
             x = F.dropout(x, p=self.dropout, training=self.training)
             # Same two-layer prediction head as the graph-level path below.
@@ -326,7 +326,7 @@ class ScalarMoleculeModel(torch.nn.Module):
             pred = self.lin2(x)  # (total_mol, num_targets)
             if mol_is_query is None:
                 raise ValueError(
-                    "mol_is_query is required when mol_index is given (context "
+                    "mol_is_query is required when mol_number is given (context "
                     "mode); mark which atoms belong to the query molecule(s)"
                 )
             query_per_mol = (

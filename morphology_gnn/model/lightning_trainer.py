@@ -166,7 +166,7 @@ class SimpleLightningMoleculeModule(pl.LightningModule):
                 (node features / atom types), ``edge_index`` (connectivity),
                 ``batch`` (graph index per node) and, optionally, ``pos`` (node
                 positions, used for geometric edge features). In context mode it
-                also carries ``mol_index`` / ``mol_is_query`` (per-molecule
+                also carries ``mol_number`` / ``mol_is_query`` (per-molecule
                 readout) and ``box`` (PBC minimum-image edge features), which are
                 forwarded to the model when present.
 
@@ -174,7 +174,7 @@ class SimpleLightningMoleculeModule(pl.LightningModule):
             Predictions of shape ``(num_graphs, 1)``.
         """
         kw: dict = {}
-        for attr in ("mol_index", "mol_is_query"):
+        for attr in ("mol_number", "mol_is_query"):
             if hasattr(data, attr):
                 kw[attr] = getattr(data, attr)
         if hasattr(data, "box"):
