@@ -18,22 +18,22 @@
 # keep `radius` at an ATOMIC scale (~4.5-6 A — NOT the COM-scale used by the
 # diffusion runner), and pick a scalar target (HOMO, HOMO-1, LUMO, LUMO+1, EA,
 # IP, S1, T1). CLI: --dataset scm
-dataset: molecular
+dataset: scm
 
 # One or more HDF5 files (same layout, same target key).
 data:
-  - data/data_Daniel/BCP.hdf5
+  - data/data_SCM_pure/2-TNATA.hdf5
 
 # Target property key(s) within each HDF5 group. Use a single string for one
 # property, or a list to train on several at once (the model outputs one value
 # per target; loss/metrics average over all of them).
-target: "Positive VIP"
+target: "HOMO"
 # target: ["Positive VIP", "HOMO"]
 
 # Radius-graph cutoff (Angstrom). REQUIRED — no default: every run must set it
 # manually (here, or with --radius). This is the cutoff for building edges
 # between atoms (radius_graph / radius_graph_pbc).
-radius: 4.5
+radius: 5.
 
 # Keep the SCM HDF5 data resident in memory: load it once at dataset
 # construction instead of re-reading the file on every __getitem__ / accessor
@@ -55,9 +55,9 @@ keep_in_memory: true
 #   k: 8           # number of neighbours for mode=knn
 # CLI: --context_mode / --context_radius / --context_k
 # context:
-#   mode: radius
-#   radius: 20.0
-#   k: 8
+#   mode: knn
+  # radius: 20.0
+  # k: 6
 
 # CUDA / hardware knobs.
 cuda:
@@ -68,10 +68,10 @@ cuda:
   tensor_cores: true
 
 model:
-  hidden_dim: 128
+  hidden_dim: 32
   num_layers: 7
   # Attention heads (only used when conv_class is GATConv).
-  heads: 16
+  heads: 8
   num_rbf: 32
   # Use geometric edge features (bond distances via RBF). For a single molecule
   # with near-identical frames, plain mean-pooled atom embeddings are almost the
@@ -81,7 +81,7 @@ model:
   # Use PBC minimum-image edge displacements instead of raw cartesian ones.
   # Needed for inter-molecular context edges (they cross the periodic box);
   # auto-set to true when the top-level `context:` block is enabled.
-  pbc_edge_features: false
+  pbc_edge_features: true
   conv_class: GATConv
   # Extra kwargs for every conv layer (e.g. GATConv: {"concat": False}).
   conv_kwargs: {}
@@ -137,6 +137,32 @@ model:
   # which concatenates their outputs) — or any other torch_geometric.nn.aggr
   # name (imported on demand, e.g. "AttentionalAggregation", "SoftmaxAggregation").
   global_aggr: MeanAggregation+MaxAggregation+VariancePreservingAggregation+StdAggregation
+  # Architecture switch: "scalar" (default) builds ScalarMoleculeModel;
+  # "hierarchical" builds the two-level atomistic + COM GNN
+  # (HierarchicalMoleculeModel). Hierarchical training needs a per-node molecule
+  # assignment (mol_index) — enable the top-level `context:` block — and
+  # `dataset: scm`. CLI: --model.arch hierarchical
+  # arch: scalar
+  # Two-level (atomistic + COM) hierarchy knobs (used only when
+  # model.arch: hierarchical; all are passed straight to the model). Each of
+  # `num_hierarchical_layers` cycles runs the atomistic conv stack, pools atoms
+  # into COM nodes (`com_aggregation`: mean | sum | attention), runs
+  # `com_num_layers` COM message-passing layers on the COM–COM graph (built from
+  # the molecular COM positions, `com_cutoff`), then broadcasts the molecular
+  # representation back to the atoms via a learnable gated residual (`com_gated`).
+  # With `atomistic_edges: intra` (default) the atomistic graph is restricted to
+  # intra-molecular edges, so molecules do NOT exchange atoms — all
+  # inter-molecular communication goes through the COM–COM graph
+  # (`com_graph: radius` = COM neighbours within com_cutoff, or `all` = every
+  # molecule of the sample, i.e. all molecules in a large vicinity).
+  #   num_hierarchical_layers: 1   # 0 disables the hierarchy (plain scalar model)
+  #   atomistic_edges: intra       # intra (default) | all
+  #   com_graph: radius            # radius (default, within com_cutoff) | all
+  #   com_cutoff: 20.0             # COM–COM radius cutoff (Angstrom)
+  #   com_aggregation: mean        # mean | sum | attention
+  #   com_hidden_channels: null    # null -> hidden_dim
+  #   com_num_layers: 1            # COM message-passing layers per cycle
+  #   com_gated: true              # gated residual in the COM -> atom step
 
 training:
   batch_size: 16
@@ -147,7 +173,7 @@ training:
   val_frac: 0.1
   test_frac: 0.1
   seed: 0
-  num_workers: 8
+  num_workers: 2
   accelerator: auto
   # Optimizer / scheduler names from the runner registries.
   optimizer_class: AdamW
@@ -188,10 +214,10 @@ logging:
   # Set to a W&B project name to enable W&B logging. When enabled, the run gets
   # a human-friendly auto-generated name from the hyperparameters (see
   # run_training._make_run_name); override it with `run_name` below.
-  wandb_project: BCP
+  wandb_project: HOMO-2TNATA-CHECKS
   # Optional W&B niceties:
   run_name: null             # e.g. "gat-h256-l4-r6.0" (auto if null)
-  group: Positive-VIP                       # group related runs together in the W&B UI
+  group: HOMO                       # group related runs together in the W&B UI
   tags: null                 # e.g. [baseline, gat]  (list)
   notes: null                # free-text description shown on the run page
   # Stdlib logging for the library + CLI (morphology_gnn._logging.configure_logging).

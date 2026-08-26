@@ -62,6 +62,7 @@ from morphology_gnn.model.lightning_trainer import (
     SimpleLightningMoleculeModule,
     r2_score,
 )
+from morphology_gnn.model.hierarchical_model import HierarchicalMoleculeModel
 from morphology_gnn.model.scaler_model import ScalarMoleculeModel
 
 log = logging.getLogger("morphology_gnn.runs.training_helpers")
@@ -441,8 +442,14 @@ _resolve_envelope = resolve_envelope
 
 def build_model(
     model_cfg: dict, radius: float | None = None, context: dict | None = None
-) -> ScalarMoleculeModel:
-    """Build a ScalarMoleculeModel from a config dict.
+) -> ScalarMoleculeModel | HierarchicalMoleculeModel:
+    """Build a model from a config dict.
+
+    ``model.arch`` selects the architecture: ``"scalar"`` (default) builds
+    :class:`~morphology_gnn.model.scaler_model.ScalarMoleculeModel`;
+    ``"hierarchical"`` builds
+    :class:`~morphology_gnn.model.hierarchical_model.HierarchicalMoleculeModel`
+    (the two-level atomistic + COM GNN, see :func:`build_hierarchical_model`).
 
     ``model.cutoff_upper`` is optional: when omitted (and not in ``rbf_kwargs``)
     it defaults to ``radius`` (the radius-graph cutoff), so the RBFs and the
@@ -454,6 +461,8 @@ def build_model(
     displacements; no separate model knob is required.
     """
     model_cfg = dict(model_cfg)
+    if model_cfg.get("arch", "scalar") == "hierarchical":
+        return build_hierarchical_model(model_cfg, radius=radius, context=context)
     if context:
         model_cfg.setdefault("pbc_edge_features", True)
     conv_class = CONV_REGISTRY[model_cfg.pop("conv_class", "GATConv")]
@@ -512,6 +521,81 @@ def build_model(
         rbf_kwargs["rbf_class"] = resolve_rbf_class(rbf_kwargs["rbf_class"])
 
     return ScalarMoleculeModel(
+        conv_class=conv_class,
+        conv_kwargs=conv_kwargs,
+        use_residual=use_residual,
+        residual_kwargs=residual_kwargs,
+        norm=norm,
+        norm_kwargs=norm_kwargs,
+        rbf_kwargs=rbf_kwargs,
+        **model_cfg,
+    )
+
+
+def build_hierarchical_model(
+    model_cfg: dict, radius: float | None = None, context: dict | None = None
+) -> HierarchicalMoleculeModel:
+    """Build a HierarchicalMoleculeModel from a config dict.
+
+    Mirrors :func:`build_model` for the ``model.arch: hierarchical`` path: the
+    same RBF / cutoff / norm / conv resolution is applied (``rbf_kwargs``,
+    ``cutoff_lower`` / ``cutoff_upper`` / ``cutoff_fn``, ``residual_kwargs`` /
+    ``norm`` / ``norm_kwargs``, ``conv_class`` / ``conv_kwargs`` / ``heads`` /
+    ``act``), then the hierarchical model is constructed with the additional
+    ``model.`` knobs passed straight through: ``num_hierarchical_layers``,
+    ``com_cutoff``, ``com_aggregation``, ``com_hidden_channels``,
+    ``com_num_layers`` and ``com_gated``.
+
+    ``context`` (the top-level ``context:`` config block) auto-enables
+    ``model.pbc_edge_features`` (as in :func:`build_model`). Hierarchical
+    training requires a per-node molecule assignment (``mol_index``), which the
+    SCM context mode provides; enable the top-level ``context:`` block.
+    """
+    model_cfg = dict(model_cfg)
+    model_cfg.pop("arch", None)  # consumed by the build_model dispatch
+    if context:
+        model_cfg.setdefault("pbc_edge_features", True)
+    conv_class = CONV_REGISTRY[model_cfg.pop("conv_class", "GATConv")]
+    heads = model_cfg.pop("heads", None)
+    conv_kwargs = dict(model_cfg.pop("conv_kwargs", {}) or {})
+    if conv_class is GATConv:
+        if heads is not None:
+            conv_kwargs.setdefault("heads", heads)
+        conv_kwargs.setdefault("concat", False)
+    act = model_cfg.pop("act", None)
+    if isinstance(act, str):
+        model_cfg["act"] = ACT_REGISTRY[act]
+    use_residual = model_cfg.pop("use_residual", True)
+    residual_kwargs = dict(model_cfg.pop("residual_kwargs", {}) or {})
+    norm = model_cfg.pop("norm", None)
+    norm_kwargs = dict(model_cfg.pop("norm_kwargs", {}) or {})
+
+    # RBF distance-embedding cutoffs (same resolution as build_model):
+    # `cutoff_upper` defaults to the radius-graph cutoff `radius`.
+    rbf_kwargs = dict(model_cfg.pop("rbf_kwargs", {}) or {})
+    cutoff_lower = model_cfg.pop("cutoff_lower", None)
+    cutoff_upper = model_cfg.pop("cutoff_upper", None)
+    cutoff_fn = model_cfg.pop("cutoff_fn", None)
+    cutoff_fn_kwargs = model_cfg.pop("cutoff_fn_kwargs", None)
+    if cutoff_upper is None:
+        cutoff_upper = rbf_kwargs.get("cutoff_upper", radius)
+    if cutoff_upper is not None:
+        rbf_kwargs.setdefault("cutoff_upper", cutoff_upper)
+    if cutoff_lower is not None:
+        rbf_kwargs.setdefault("cutoff_lower", cutoff_lower)
+    if "cutoff_fn" not in rbf_kwargs and cutoff_fn is not None:
+        rbf_kwargs["cutoff_fn"] = cutoff_fn
+    if "cutoff_fn" in rbf_kwargs:
+        rbf_kwargs["cutoff_fn"] = _resolve_envelope(rbf_kwargs["cutoff_fn"])
+    deep_cfk = dict(rbf_kwargs.pop("cutoff_fn_kwargs", {}) or {})
+    merged_cfk = dict(cutoff_fn_kwargs or {})
+    merged_cfk.update(deep_cfk)
+    if merged_cfk:
+        rbf_kwargs["cutoff_fn_kwargs"] = merged_cfk
+    if "rbf_class" in rbf_kwargs:
+        rbf_kwargs["rbf_class"] = resolve_rbf_class(rbf_kwargs["rbf_class"])
+
+    return HierarchicalMoleculeModel(
         conv_class=conv_class,
         conv_kwargs=conv_kwargs,
         use_residual=use_residual,
