@@ -297,7 +297,7 @@ def pbc_center_of_mass(
     cross the periodic boundary are brought back to a contiguous spatial
     arrangement, then the (mass-weighted) mean position is computed. When
     ``wrap=True`` the result is folded back into the cell so it can be compared
-    with the values stored under ``molecules/position`` in the SCM-pure HDF5
+    with the values stored under ``molecules/position`` in the box HDF5
     files.
 
     Args:

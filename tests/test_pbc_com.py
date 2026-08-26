@@ -8,7 +8,7 @@ Covers:
   is pulled toward the heavier atom.
 * The wrapped COM is invariant to the unwrap strategy (reference-image vs bonds).
 * ``molecule_center_of_mass`` reproduces ``molecules/position`` in the real
-  SCM-pure HDF5 files (skip-if-no-data, same pattern as test_diffusion_model.py).
+  box HDF5 files (skip-if-no-data, same pattern as test_diffusion_model.py).
 """
 
 from __future__ import annotations
@@ -29,9 +29,9 @@ from morphology_gnn.radius_graph import (
 )
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
-SCM_FILES = sorted(glob.glob(os.path.join(DATA_DIR, "data_SCM_pure", "*.hdf5")))
+BOX_FILES = sorted(glob.glob(os.path.join(DATA_DIR, "data_box_pure", "*.hdf5")))
 requires_data = pytest.mark.skipif(
-    not SCM_FILES, reason="no SCM-pure hdf5 files found in data/data_SCM_pure/"
+    not BOX_FILES, reason="no box hdf5 files found in data/data_box_pure/"
 )
 
 
@@ -180,12 +180,12 @@ def test_pbc_center_of_mass_accepts_general_lattice():
 
 
 # --------------------------------------------------------------------------- #
-# Real SCM data
+# Real box data
 # --------------------------------------------------------------------------- #
 @requires_data
 def test_molecule_center_of_mass_matches_stored_positions():
     """``molecule_center_of_mass`` reproduces ``molecules/position`` (both unwraps)."""
-    path = SCM_FILES[0]
+    path = BOX_FILES[0]
     with h5py.File(path, "r") as hf:
         lattice = torch.tensor(hf["molecules/lattice"][:], dtype=torch.float)
         stored = torch.tensor(hf["molecules/position"][:], dtype=torch.float)
@@ -200,9 +200,9 @@ def test_molecule_center_of_mass_matches_stored_positions():
 
 
 @requires_data
-def test_scm_files_are_orthorhombic():
-    """The SCM-pure cells are orthorhombic (diffusion box-length assumption)."""
-    for path in SCM_FILES:
+def test_box_files_are_orthorhombic():
+    """The box cells are orthorhombic (diffusion box-length assumption)."""
+    for path in BOX_FILES:
         with h5py.File(path, "r") as hf:
             lat = np.asarray(hf["molecules/lattice"][:])
         assert np.allclose(lat, np.diag(np.diagonal(lat))), path

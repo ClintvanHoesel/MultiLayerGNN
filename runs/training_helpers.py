@@ -48,7 +48,7 @@ from torch_geometric.nn import (
 
 from morphology_gnn.data import (
     CombinedH5MolecularDataset,
-    CombinedSCMMolecularDataset,
+    CombinedBoxMolecularDataset,
 )
 from morphology_gnn.model.envelope import (
     ENVELOPE_REGISTRY,
@@ -126,22 +126,22 @@ RBF_REGISTRY = RBF_REGISTRY  # re-exported from morphology_gnn.model.rbf
 DEFAULT_CONFIG = {
     "data": ["data/2-TNATA_ams.hdf5"],
     "target": "Positive VIP",
-    # Dataset layout: "molecular" (default) or "scm".
+    # Dataset layout: "molecular" (default) or "box".
     #   molecular — per-frame MD *_ams.hdf5 files (CombinedH5MolecularDataset).
-    #   scm       — SCM-pure per-molecule files in data/data_SCM_pure/
-    #               (CombinedSCMMolecularDataset); short-name targets (HOMO, S1,
+    #   box       — box per-molecule files in data/data_box_pure/
+    #               (CombinedBoxMolecularDataset); short-name targets (HOMO, S1,
     #               ...) are resolved inside the dataset class. Select via the
-    #               `dataset:` config key or `--dataset scm` (see build_dataset()).
-    "dataset": "scm",
+    #               `dataset:` config key or `--dataset box` (see build_dataset()).
+    "dataset": "box",
     # Radius-graph cutoff (Angstrom). REQUIRED — there is no built-in default;
     # every run must set it manually (config file `radius:` or --radius).
     "radius": None,
-    # Keep the SCM HDF5 data resident in memory: load it once at dataset
+    # Keep the box HDF5 data resident in memory: load it once at dataset
     # construction instead of re-reading the file on every __getitem__ /
-    # accessor call. Only affects `dataset: scm` (SCMMolecularDataset /
-    # CombinedSCMMolecularDataset). CLI: --keep_in_memory.
+    # accessor call. Only affects `dataset: box` (BoxMolecularDataset /
+    # CombinedBoxMolecularDataset). CLI: --keep_in_memory.
     "keep_in_memory": False,
-    # Optional surrounding-molecule context for `dataset: scm` per-molecule
+    # Optional surrounding-molecule context for `dataset: box` per-molecule
     # training. A dict like {"mode": "radius"|"knn"|"all", "radius": 20.0,
     # "k": 8} (or null / empty to disable). When enabled, each sample's graph
     # additionally contains the atoms of the query molecule's surrounding
@@ -277,7 +277,7 @@ DEFAULT_CONFIG = {
 FLAG_DEFS = [
     ("data", "data", dict(nargs="+")),
     ("target", "target", dict(nargs="+")),
-    ("dataset", "dataset", dict(choices=["molecular", "scm"])),
+    ("dataset", "dataset", dict(choices=["molecular", "box"])),
     ("radius", "radius", dict(type=float)),
     (
         "keep_in_memory",
@@ -418,16 +418,16 @@ def build_dataset(config: dict):
     """Build the scalar-regression dataset from the resolved config.
 
     ``dataset: molecular`` (default) -> per-frame MD files
-    (:class:`CombinedH5MolecularDataset`); ``dataset: scm`` -> SCM-pure
-    per-molecule files (:class:`CombinedSCMMolecularDataset`). Short-name SCM
+    (:class:`CombinedH5MolecularDataset`); ``dataset: box`` -> box
+    per-molecule files (:class:`CombinedBoxMolecularDataset`). Short-name box
     targets (``HOMO``, ``S1``, ...) are resolved inside the dataset class.
     """
     data_files = config["data"]
     if isinstance(data_files, str):
         data_files = [data_files]
     targets = normalize_targets(config["target"])
-    if config.get("dataset") == "scm":
-        return CombinedSCMMolecularDataset(
+    if config.get("dataset") == "box":
+        return CombinedBoxMolecularDataset(
             data_files,
             targets,
             radius=config["radius"],
@@ -549,7 +549,7 @@ def build_hierarchical_model(
     ``context`` (the top-level ``context:`` config block) auto-enables
     ``model.pbc_edge_features`` (as in :func:`build_model`). Hierarchical
     training requires a per-node molecule assignment (``mol_index``), which the
-    SCM context mode provides; enable the top-level ``context:`` block.
+    box context mode provides; enable the top-level ``context:`` block.
     """
     model_cfg = dict(model_cfg)
     model_cfg.pop("arch", None)  # consumed by the build_model dispatch
@@ -941,7 +941,7 @@ def build_callbacks(
     ``name_prefix`` (e.g. the W&B run name) is prepended to the checkpoint
     filename so checkpoints are uniquely identifiable per run. ``monitor``
     defaults to ``val_loss``; pass ``train_loss`` when the run has no validation
-    loader (e.g. SCM diffusion on a single box).
+    loader (e.g. box diffusion on a single box).
     """
     filename = f"best-{{epoch}}-{{{monitor}:.4f}}"
     if name_prefix:

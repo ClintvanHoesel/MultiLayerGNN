@@ -31,7 +31,7 @@ from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import radius_graph
 
-from morphology_gnn.data import SCMMolecularDataset
+from morphology_gnn.data import BoxMolecularDataset
 from morphology_gnn.model.hierarchical_model import (
     AtomToCOM,
     COMToAtom,
@@ -46,8 +46,8 @@ N_ATOMS = 4  # atoms per molecule in the synthetic box
 NCOL = 3  # columns in the molecule grid
 
 
-def _make_scm_file(path: str, n: int = 6, seed: int = 0) -> str:
-    """Write a small SCM-pure HDF5 file (one box of ``n`` C/N/O/C molecules).
+def _make_box_file(path: str, n: int = 6, seed: int = 0) -> str:
+    """Write a small box HDF5 file (one box of ``n`` C/N/O/C molecules).
 
     Molecules sit on a 2 x 3 grid (spacing 3.3 A) so neighbours are well
     defined, and a scalar ``energies/HOMO`` target is stored per molecule.
@@ -392,8 +392,8 @@ def test_hierarchical_model_rotation_and_translation_invariance():
 # Gradient flow + full PBC forward
 # --------------------------------------------------------------------------- #
 def test_gradient_flow_through_hierarchy(tmp_path):
-    p = _make_scm_file(str(tmp_path / "box.hdf5"), n=6)
-    ds = SCMMolecularDataset(
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
+    ds = BoxMolecularDataset(
         p, target_key="HOMO", radius=3.0, keep_in_memory=True, context={"mode": "all"}
     )
     loader = DataLoader(ds, batch_size=4)
@@ -415,8 +415,8 @@ def test_gradient_flow_through_hierarchy(tmp_path):
 
 
 def test_hierarchical_forward_shapes_on_context_batch(tmp_path):
-    p = _make_scm_file(str(tmp_path / "box.hdf5"), n=6)
-    ds = SCMMolecularDataset(
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
+    ds = BoxMolecularDataset(
         p, target_key="HOMO", radius=3.0, keep_in_memory=True, context={"mode": "all"}
     )
     d = ds[0]
@@ -442,8 +442,8 @@ def test_hierarchical_intra_atomistic_edges_and_com_all(tmp_path):
     """Context on: the atomistic graph is intra-molecular only (no atom-level
     cross-talk) while the COM graph is fully connected (com_graph="all"), and
     gradients still flow through the whole atoms -> COM -> atoms path."""
-    p = _make_scm_file(str(tmp_path / "box.hdf5"), n=6)
-    ds = SCMMolecularDataset(
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
+    ds = BoxMolecularDataset(
         p, target_key="HOMO", radius=3.0, keep_in_memory=True, context={"mode": "all"}
     )
     loader = DataLoader(ds, batch_size=4)
@@ -470,8 +470,8 @@ def test_hierarchical_intra_atomistic_edges_and_com_all(tmp_path):
 # Backward compatibility
 # --------------------------------------------------------------------------- #
 def test_backward_compat_num_hierarchical_layers_zero(tmp_path):
-    p = _make_scm_file(str(tmp_path / "box.hdf5"), n=6)
-    ds = SCMMolecularDataset(p, target_key=None, radius=3.0, keep_in_memory=True)
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
+    ds = BoxMolecularDataset(p, target_key=None, radius=3.0, keep_in_memory=True)
     batch = Batch.from_data_list([ds[0]])
     cfg = dict(
         hidden_dim=16,
@@ -498,8 +498,8 @@ def test_backward_compat_num_hierarchical_layers_zero(tmp_path):
 def test_mol_index_none_degrades_to_per_graph(tmp_path):
     # Per-molecule samples (no context -> no mol_index): hierarchical model runs
     # with each graph treated as one molecule (per-graph readout).
-    p = _make_scm_file(str(tmp_path / "box.hdf5"), n=6)
-    ds = SCMMolecularDataset(p, target_key=None, radius=3.0, keep_in_memory=True)
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
+    ds = BoxMolecularDataset(p, target_key=None, radius=3.0, keep_in_memory=True)
     loader = DataLoader(ds, batch_size=4)
     batch = next(iter(loader))
     model = _make_hierarchical_model(num_hierarchical_layers=2)
@@ -519,8 +519,8 @@ def test_lightning_training_step(tmp_path):
         SimpleLightningMoleculeModule,
     )
 
-    p = _make_scm_file(str(tmp_path / "box.hdf5"), n=6)
-    ds = SCMMolecularDataset(
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
+    ds = BoxMolecularDataset(
         p, target_key="HOMO", radius=3.0, keep_in_memory=True, context={"mode": "all"}
     )
     loader = DataLoader(ds, batch_size=4)

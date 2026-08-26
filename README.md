@@ -19,7 +19,7 @@ I use three connected levels:
 
 1. **Atoms.** Atoms are connected with a radius graph. Their types and
    distance-based edge features describe the molecular geometry.
-2. **The local environment.** In the SCM data, I can add the nearby molecules
+2. **The local environment.** In the box data, I can add the nearby molecules
    around one query molecule. They are selected using periodic COM distances,
    either by radius, nearest neighbours, or by taking the full box. Only the
    query molecule is used for the loss; the other molecules give it context.
@@ -31,7 +31,7 @@ The idea is not to replace full simulations, but to learn a useful surrogate
 for morphology-dependent molecular properties at a scale where a fully
 atomistic treatment of every molecule is no longer practical.
 
-At the moment the repository includes property prediction from HDF5 MD and SCM
+At the moment the repository includes property prediction from HDF5 MD and box
 data, multi-target training, PBC-aware graphs, the optional atomistic + COM
 hierarchy, cross-validation, W&B logging, and a diffusion model for periodic
 molecular geometries.
@@ -40,7 +40,7 @@ molecular geometries.
 
 | Path | Purpose |
 | --- | --- |
-| `morphology_gnn/data.py` | HDF5 datasets, periodic graph construction, SCM context assembly |
+| `morphology_gnn/data.py` | HDF5 datasets, periodic graph construction, box context assembly |
 | `morphology_gnn/model/` | Scalar, hierarchical, and diffusion GNN models |
 | `morphology_gnn/radius_graph.py` | Periodic-boundary and COM geometry utilities |
 | `runs/config.yaml` | Main property-regression configuration and documented options |
@@ -87,12 +87,12 @@ Set the dataset path, target, and atomic graph cutoff in
 python runs/run_training.py --config runs/config.yaml
 ```
 
-For an SCM dataset and a single target:
+For a box dataset and a single target:
 
 ```bash
 python runs/run_training.py --config runs/config.yaml \
-  --dataset scm \
-  --data data/data_SCM_pure/example.hdf5 \
+  --dataset box \
+  --data data/data_box_pure/example.hdf5 \
   --target HOMO \
   --radius 5.0
 ```
@@ -102,15 +102,15 @@ not the molecular COM cutoff used to choose surrounding context.
 
 ### Include the molecular environment
 
-Enable context for SCM data to predict a query molecule in its local packing
+Enable context for box data to predict a query molecule in its local packing
 environment. Neighbours are selected using periodic COM distances and are
 included in the input graph, but only the query molecule contributes to the
 supervised target and loss.
 
 ```bash
 python runs/run_training.py --config runs/config.yaml \
-  --dataset scm \
-  --data data/data_SCM_pure/example.hdf5 \
+  --dataset box \
+  --data data/data_box_pure/example.hdf5 \
   --target HOMO --radius 5.0 \
   --context_mode knn --context_k 6
 ```
@@ -123,14 +123,14 @@ represented consistently.
 
 ### Use the hierarchical atomistic + COM model
 
-The hierarchical architecture requires SCM context, because it needs a
+The hierarchical architecture requires box context, because it needs a
 molecule assignment for every atom. It alternates atomistic message passing,
 atom-to-COM pooling, COM-to-COM message passing, and COM-to-atom feedback:
 
 ```bash
 python runs/run_training.py --config runs/config.yaml \
-  --dataset scm \
-  --data data/data_SCM_pure/example.hdf5 \
+  --dataset box \
+  --data data/data_box_pure/example.hdf5 \
   --target HOMO --radius 5.0 \
   --context_mode radius --context_radius 20.0 \
   --model.arch hierarchical \
@@ -151,7 +151,7 @@ The training runner supports two layouts:
 - `molecular`: HDF5 groups containing `pos`, `types`, target property arrays,
   and optionally a `lattice`. A `(frames, atoms, 3)` `pos` array is exposed as
   one graph per frame.
-- `scm`: SCM-pure per-molecule HDF5 files. This mode supports surrounding
+- `box`: box per-molecule HDF5 files. This mode supports surrounding
   molecular context and is the required input mode for the hierarchical model.
 
 HDF5 target keys are configurable. Supply several `--target` values (or a YAML
@@ -161,13 +161,13 @@ list) for multi-target learning; output width is inferred automatically.
 
 The diffusion runner trains an SE(3)-equivariant denoiser for periodic
 geometries. It supports atom-position generation in molecular data and
-molecule-COM position generation in SCM boxes:
+molecule-COM position generation in boxes:
 
 ```bash
 python runs/run_diffusion.py --config runs/config_diffusion.yaml
 ```
 
-In SCM diffusion mode, the radius is a **COM-scale** graph cutoff, so it should
+In box diffusion mode, the radius is a **COM-scale** graph cutoff, so it should
 be chosen on the scale of molecular separations rather than atomic bonds.
 
 ## Runs and evaluation

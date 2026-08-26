@@ -11,7 +11,7 @@
 #
 # Usage examples:
 #   ./runs/run_training_loop.sh                                        # defaults
-#   ./runs/run_training_loop.sh --data-dir data/data_SCM_pure --radius 20.0
+#   ./runs/run_training_loop.sh --data-dir data/data_box_pure --radius 20.0
 #   ./runs/run_training_loop.sh --python $HOME/miniforge3/envs/torch/bin/python \
 #       --max_epochs 100 --wandb_project MyProject
 #   ./runs/run_training_loop.sh --dry-run --data-dir data/data_Daniel   # just print

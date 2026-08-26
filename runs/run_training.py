@@ -19,14 +19,14 @@ passing the dotted config path::
         --training.optimizer_kwargs.betas "[0.9, 0.999]" \\
         --training.scheduler_class ReduceLROnPlateau \\
         --logging.wandb_project InitialGNNtrial
-    SCM-pure molecular files (``data/data_SCM_pure/``) train with
-    ``--dataset scm`` (config ``dataset: scm``). The graph connects each
+    box per-molecule files (``data/data_box_pure/``) train with
+    ``--dataset box`` (config ``dataset: box``). The graph connects each
     molecule's atoms, so keep ``--radius`` at an atomic scale (~4.5-6 A, NOT the
     COM-scale used by the diffusion runner), and use short-name scalar targets
     (``HOMO``, ``S1``, ...) which are resolved automatically::
 
-        python runs/run_training.py --dataset scm \
-            --data data/data_SCM_pure/2-TNATA.hdf5 --target HOMO \
+        python runs/run_training.py --dataset box \
+            --data data/data_box_pure/2-TNATA.hdf5 --target HOMO \
             --radius 4.5 --max_epochs 100"""
 
 from __future__ import annotations
@@ -233,7 +233,7 @@ def main() -> None:
 
     logger = None
     try:
-        # 1. Dataset (one or several HDF5 files; molecular or SCM-pure layout
+        # 1. Dataset (one or several HDF5 files; molecular or box layout
         #    selected by `dataset` / --dataset — see build_dataset()).
         dataset = build_dataset(config)
 

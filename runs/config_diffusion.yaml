@@ -1,7 +1,7 @@
-# Diffusion position-generator configuration (SCM "morphology" mode).
+# Diffusion position-generator configuration (box "morphology" mode).
 #
 # Trains an EGNN-style SE(3)-equivariant denoiser (epsilon-prediction DDPM) on
-# molecule center-of-mass positions: each sample is one SCM-pure periodic box of
+# molecule center-of-mass positions: each sample is one periodic box of
 # N molecules, and the model learns to denoise / generate the N center-of-mass
 # coordinates (molecules/position) conditioned on the molecule species + cell —
 # i.e. the molecular packing of the box.
@@ -14,27 +14,27 @@
 #   --diffusion.schedule linear
 #   --sampling.steps 50 --sampling.ddim true
 
-# Dataset layout: "scm" (SCM-pure boxes of molecules, COM positions) or
+# Dataset layout: "box" (boxes of molecules, COM positions) or
 # "molecular" (per-frame MD *_ams.hdf5, per-atom positions).
-dataset: scm
+dataset: box
 
-# One or more SCM-pure HDF5 files (one periodic box per file).
+# One or more box HDF5 files (one periodic box per file).
 data:
-  - data/data_SCM_pure/BCP.hdf5
+  - data/data_box_pure/BCP.hdf5
 
 # Target property key(s) within each HDF5 group. UNUSED by the diffusion model
-# (no property conditioning); the SCM dataset is built with target_key=None.
+# (no property conditioning); the box dataset is built with target_key=None.
 target: null
 
 # Radius-graph cutoff (Angstrom) for the PBC neighbor list. REQUIRED — no
 # default: every run must set it manually (here, or with --radius).
-# NOTE: in SCM mode the graph connects molecule CENTERS, so use a COM-scale
+# NOTE: in box mode the graph connects molecule CENTERS, so use a COM-scale
 # cutoff (molecule separation, e.g. 15-25 A), NOT the ~4 A atomic value.
 radius: 20.0
 
-# Keep the SCM HDF5 data resident in memory: load it once at dataset
+# Keep the box HDF5 data resident in memory: load it once at dataset
 # construction instead of re-reading the file on every accessor call. Only
-# affects `dataset: scm` (CombinedSCMMolecularDataset). CLI: --keep_in_memory.
+# affects `dataset: box` (CombinedBoxMolecularDataset). CLI: --keep_in_memory.
 keep_in_memory: true
 
 # CUDA / hardware knobs.
@@ -91,7 +91,7 @@ training:
   weight_decay: 0.0
   max_epochs: 200
   patience: 30
-  # With only a few SCM boxes per dataset the fractional split can produce empty
+  # With only a few boxes per dataset the fractional split can produce empty
   # val/test loaders (guarded in the runner; generation then runs on all boxes).
   val_frac: 0.1
   test_frac: 0.1

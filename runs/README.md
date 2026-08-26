@@ -181,10 +181,10 @@ Two dataset layouts (`dataset:` in the config):
 
 - **`molecular`** (default): per-frame MD `*_ams.hdf5` files — the model
   generates **per-atom positions** (a molecule conformation inside its cell).
-- **`scm`**: SCM-pure boxes — the model generates the **N molecule
+- **`box`**: boxes — the model generates the **N molecule
   center-of-mass positions** (`molecules/position`) that make up the box.
   Box-level samples (molecules as nodes) are assembled from
-  `CombinedSCMMolecularDataset.box_sample` by the runner, so no dedicated
+  `CombinedBoxMolecularDataset.box_sample` by the runner, so no dedicated
   diffusion dataset class is needed.
 
 Configuration precedence is identical to `run_training.py`:
@@ -194,7 +194,7 @@ built-in defaults  <  config file  <  CLI flags  <  deep overrides
 ```
 
 ```bash
-# Everything from the config file (SCM mode by default: runs/config_diffusion.yaml)
+# Everything from the config file (box mode by default: runs/config_diffusion.yaml)
 python runs/run_diffusion.py --config runs/config_diffusion.yaml
 
 # Molecular (per-atom) mode with explicit cutoff + a few flags
@@ -207,11 +207,11 @@ python runs/run_diffusion.py --config runs/config_diffusion.yaml \
 ```
 
 **`radius` is required** (no default), exactly as in `run_training.py`. Note
-that in **SCM mode the graph connects molecule centers**, so use a COM-scale
+that in **box mode the graph connects molecule centers**, so use a COM-scale
 cutoff (molecule separation, e.g. 15–25 Å) — not the ~4 Å atomic value used in
 `molecular` mode.
 
-Key flags: `--data <files...> --dataset {molecular,scm} --radius
+Key flags: `--data <files...> --dataset {molecular,box} --radius
 --hidden_dim --num_layers --heads --num_rbf --conv_class
 --noise_schedule {cosine,linear} --batch_size --lr --max_epochs --patience
 --seed --num_workers --accelerator --sampling_steps --sampling_ddim
@@ -223,13 +223,13 @@ overrides): `steps` (reverse-diffusion steps, default 100), `ddim`
 stochasticity), `num_samples` (structures per reference frame),
 `num_reference` (frames to condition on), `seed`.
 
-With SCM data (few boxes per dataset) the validation/test splits can be empty;
+With box data (few boxes per dataset) the validation/test splits can be empty;
 the runner detects this, falls back to monitoring `train_loss`, and evaluates
 generation on the full dataset. Artifacts land in `logging.outdir/<run name>/`
 (`runs/artifacts_diffusion/` by default, one folder per run): best checkpoint,
 `generation_<split>.png` (truth vs generated pair correlation + RMSD/min-pair histograms),
 `*_generated.npz` (generated structures) and XYZ files for visualization
-(`<split>_sample_<i>.xyz` — for SCM data these are the full reconstructed
+(`<split>_sample_<i>.xyz` — for box data these are the full reconstructed
 boxes). Use `--wandb-project <name>` to log metrics and plots to W&B; otherwise
 a `CSVLogger` is used.
 

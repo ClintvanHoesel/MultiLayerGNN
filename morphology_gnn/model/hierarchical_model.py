@@ -25,7 +25,7 @@ and the whole cycle is repeated ``num_hierarchical_layers`` times with
 *independent* blocks per cycle (each block has its own weights).
 
 Molecular identity is taken from the per-node ``mol_index`` tensor already
-produced by the SCM context-mode dataset (``SCMMolecularDataset(context=...)``).
+produced by the box context-mode dataset (``BoxMolecularDataset(context=...)``).
 After PyG batching ``mol_index`` is treated as an *opaque* grouping key (PyG
 offsets any ``*index`` node attribute by per-sample node counts), so it is
 re-indexed into contiguous, batch-unique ids inside ``forward``.
@@ -1023,7 +1023,7 @@ class HierarchicalMoleculeModel(nn.Module):
                 "passed to forward (used to compute the COM positions)"
             )
         # Molecular grouping: use the existing per-node `mol_index` when given
-        # (SCM context mode), otherwise treat each graph as a single molecule.
+        # (box context mode), otherwise treat each graph as a single molecule.
         per_molecule = mol_index is not None
         if mol_index is None:
             mol_index = batch

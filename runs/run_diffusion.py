@@ -44,7 +44,7 @@ from torch_geometric.nn import GATConv  # noqa: E402
 
 from morphology_gnn.data import (  # noqa: E402
     CombinedH5MolecularDataset,
-    CombinedSCMMolecularDataset,
+    CombinedBoxMolecularDataset,
 )
 from morphology_gnn.model.diffusion_model import DiffusionMoleculeModel  # noqa: E402
 from morphology_gnn.model.diffusion_trainer import (  # noqa: E402
@@ -91,7 +91,7 @@ log = logging.getLogger("morphology_gnn.runs.run_diffusion")
 DEFAULT_CONFIG = {
     "data": ["data/2-TNATA_ams.hdf5"],
     # Dataset layout: "molecular" (per-frame MD *_ams.hdf5 files; the model
-    # generates per-atom positions) or "scm" (SCM-pure boxes; the model then
+    # generates per-atom positions) or "box" (box samples; the model then
     # generates the N molecule center-of-mass positions, ``molecules/position``).
     "dataset": "molecular",
     # Target property key(s). Required by the dataset loader, but UNUSED by the
@@ -99,9 +99,9 @@ DEFAULT_CONFIG = {
     "target": "Positive VIP",
     # Radius-graph cutoff (Angstrom). REQUIRED — no built-in default.
     "radius": None,
-    # Keep the SCM HDF5 data resident in memory: load it once at dataset
+    # Keep the box HDF5 data resident in memory: load it once at dataset
     # construction instead of re-reading the file on every accessor call. Only
-    # affects `dataset: scm` (CombinedSCMMolecularDataset). CLI: --keep_in_memory.
+    # affects `dataset: box` (CombinedBoxMolecularDataset). CLI: --keep_in_memory.
     "keep_in_memory": False,
     "model": {
         "hidden_dim": 128,
@@ -180,7 +180,7 @@ DEFAULT_CONFIG = {
 FLAG_DEFS = [
     ("data", "data", dict(nargs="+")),
     ("radius", "radius", dict(type=float)),
-    ("dataset", "dataset", dict(choices=["molecular", "scm"])),
+    ("dataset", "dataset", dict(choices=["molecular", "box"])),
     (
         "keep_in_memory",
         "keep_in_memory",
@@ -396,20 +396,20 @@ def build_diffusion_module(model, config: dict) -> DiffusionMoleculeModule:
     return DiffusionMoleculeModule(model, **kw)
 
 
-class SCMBoxDataset(Dataset):
-    """One PyG sample per SCM-pure box, built on :class:`CombinedSCMMolecularDataset`.
+class BoxDataset(Dataset):
+    """One PyG sample per box, built on :class:`CombinedBoxMolecularDataset`.
 
     The diffusion position-generator treats one periodic box as a single sample
     whose *nodes are the molecules*: ``pos`` = molecule center-of-mass positions,
     ``x`` = per-molecule species index, ``edge_index`` = PBC radius graph over the
     COMs. These box-level samples are assembled by
-    :meth:`CombinedSCMMolecularDataset.box_sample` from the per-molecule dataset
+    :meth:`CombinedBoxMolecularDataset.box_sample` from the per-molecule dataset
     (no dedicated diffusion dataset class is needed); :meth:`box_reference`
     exposes the per-molecule metadata for full-box reconstruction at generation
     time.
     """
 
-    def __init__(self, molecular: CombinedSCMMolecularDataset, radius: float):
+    def __init__(self, molecular: CombinedBoxMolecularDataset, radius: float):
         self.molecular = molecular
         self.radius = radius
         super().__init__(root=None)
@@ -434,22 +434,22 @@ def build_dataset(config: dict):
     """Build the diffusion dataset from the resolved config.
 
     ``dataset: molecular`` -> per-frame MD files (:class:`CombinedH5MolecularDataset`,
-    per-atom positions). ``dataset: scm`` -> SCM-pure boxes via
-    :class:`SCMBoxDataset` over :class:`CombinedSCMMolecularDataset`
+    per-atom positions). ``dataset: box`` -> box samples via
+    :class:`BoxDataset` over :class:`CombinedBoxMolecularDataset`
     (molecule center-of-mass positions). The target is unused by the diffusion
-    model, so the SCM dataset is built with ``target_key=None``.
+    model, so the box dataset is built with ``target_key=None``.
     """
     data_files = config["data"]
     if isinstance(data_files, str):
         data_files = [data_files]
-    if config.get("dataset") == "scm":
-        molecular = CombinedSCMMolecularDataset(
+    if config.get("dataset") == "box":
+        molecular = CombinedBoxMolecularDataset(
             data_files,
             target_key=None,
             radius=config["radius"],
             keep_in_memory=config.get("keep_in_memory", False),
         )
-        return SCMBoxDataset(molecular, radius=config["radius"])
+        return BoxDataset(molecular, radius=config["radius"])
     return CombinedH5MolecularDataset(
         data_files, config["target"], radius=config["radius"]
     )
@@ -465,7 +465,7 @@ def _make_run_name(config: dict) -> str:
     conv = str(model.get("conv_class", "GATConv")).rsplit(".", 1)[-1]
     parts = [
         "diff",
-        "scm" if config.get("dataset") == "scm" else "mol",
+        "box" if config.get("dataset") == "box" else "mol",
         conv,
         f"h{model.get('hidden_dim', 128)}",
         f"l{model.get('num_layers', 2)}",
@@ -578,7 +578,7 @@ def evaluate_generation(module, loader, sampling_cfg: dict, device):
 
     ds = loader.dataset
     # Generation may run over a torch.utils.data.Subset (train/val/test split);
-    # unwrap to the base dataset so per-molecule reference metadata (SCM) is
+    # unwrap to the base dataset so per-molecule reference metadata (box) is
     # available for full-box reconstruction.
     base, subset_indices = ds, None
     while isinstance(base, torch.utils.data.Subset):
@@ -623,7 +623,7 @@ def evaluate_generation(module, loader, sampling_cfg: dict, device):
         if has_box_ref:
             orig_idx = subset_indices[i] if subset_indices is not None else i
             # `base` is statically a PyG Dataset; box_reference only exists on the
-            # SCM box dataset (guarded by has_box_ref above).
+            # box dataset (guarded by has_box_ref above).
             ref["box_ref"] = getattr(base, "box_reference")(orig_idx)
         refs.append(ref)
 
@@ -688,7 +688,7 @@ def plot_generation_figures(refs, outdir: str, split: str) -> str:
 def save_generated_structures(outdir: str, split: str, refs) -> None:
     """Save generated conformations as npz + a few XYZ files for visualization.
 
-    For SCM box data (per-molecule reference available) the XYZ files hold the
+    For box data (per-molecule reference available) the XYZ files hold the
     full reconstructed box (reference molecules placed at the generated COMs);
     otherwise they hold the generated center-of-mass / atomic positions.
     """
@@ -754,7 +754,7 @@ def main() -> None:
         )
         module = build_diffusion_module(model, config)
 
-        # 3. Logger + callbacks (early stopping + best checkpoint). With SCM data
+        # 3. Logger + callbacks (early stopping + best checkpoint). With box data
         #    the val loader may be empty (few boxes); fall back to monitoring the
         #    training loss in that case.
         # Run name fixed by resolve_run_outdir, so it matches the per-run folder.
@@ -781,13 +781,13 @@ def main() -> None:
         if len(test_loader) > 0:
             trainer.test(module, test_loader)
 
-        # 4. Generation evaluation. With SCM data there are only a few boxes per
+        # 4. Generation evaluation. With box data there are only a few boxes per
         #    dataset, so evaluate generation on every box (total) rather than on
         #    possibly-empty val/test splits.
         device = next(module.parameters()).device
         gen_metrics = {}
         eval_loaders = [("val", val_loader), ("test", test_loader)]
-        if config.get("dataset") == "scm" or all(len(l) == 0 for _, l in eval_loaders):
+        if config.get("dataset") == "box" or all(len(l) == 0 for _, l in eval_loaders):
             eval_loaders = [("total", total_loader)]
         for split, loader in eval_loaders:
             metrics, refs = evaluate_generation(

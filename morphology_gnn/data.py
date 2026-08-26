@@ -357,7 +357,7 @@ def get_combined_h5_dataset(
 
 
 # ---------------------------------------------------------------------------
-# AMS OLED "SCM pure" HDF5 layout: one periodic box of N molecules per file.
+# AMS OLED "box" HDF5 layout: one periodic box of N molecules per file.
 # ---------------------------------------------------------------------------
 
 # Element symbol -> atomic number conversion is delegated to
@@ -379,10 +379,10 @@ def _atomic_mass(symbol) -> float:
     return float(PT.get_mass(symbol.strip().capitalize()))
 
 
-def _bonds_from_scm(bonds):
-    """Convert an SCM ``molecules/bonds[i]`` record into 0-based ``(E, 2)`` indices.
+def _bonds_from_box(bonds):
+    """Convert a box ``molecules/bonds[i]`` record into 0-based ``(E, 2)`` indices.
 
-    SCM bond records are structured arrays with ``(atom_1, atom_2, bond_order)``
+    Box bond records are structured arrays with ``(atom_1, atom_2, bond_order)``
     fields using **1-based** atom indices. Numeric ``(E, 2)`` inputs (or a plain
     tensor) are passed through unchanged; ``None`` stays ``None``.
     """
@@ -399,15 +399,15 @@ def _bonds_from_scm(bonds):
                 dim=1,
             )
         raise ValueError(
-            f"unexpected SCM bonds fields {b.dtype.names}; expected atom_1/atom_2"
+            f"unexpected box bonds fields {b.dtype.names}; expected atom_1/atom_2"
         )
     return torch.as_tensor(b, dtype=torch.long)
 
 
 def molecule_center_of_mass(struct_atoms, lattice, bonds=None) -> torch.Tensor:
-    """PBC-aware, mass-weighted center of mass of one SCM-pure molecule.
+    """PBC-aware, mass-weighted center of mass of one box molecule.
 
-    Matches the values stored under ``molecules/position`` in the SCM-pure HDF5
+    Matches the values stored under ``molecules/position`` in the box HDF5
     files: the wrapped atoms are first unwrapped (:func:`unwrap_molecule`) so
     atoms that cross the periodic boundary are brought back to a contiguous
     spatial arrangement, then the center of mass is computed using the per-element
@@ -419,7 +419,7 @@ def molecule_center_of_mass(struct_atoms, lattice, bonds=None) -> torch.Tensor:
             ``symbol``, ``x``, ``y``, ``z``).
         lattice: The periodic box lattice -- ``(3,)`` box lengths or ``(3, 3)``
             matrix.
-        bonds: Optional connectivity for the graph-based unwrap: the raw SCM
+        bonds: Optional connectivity for the graph-based unwrap: the raw box
             ``molecules/bonds[i]`` structured array, or a numeric ``(E, 2)``
             (0-based) index pair tensor.
 
@@ -434,13 +434,13 @@ def molecule_center_of_mass(struct_atoms, lattice, bonds=None) -> torch.Tensor:
         pos,
         torch.as_tensor(lattice, dtype=torch.float),
         masses=masses,
-        bonds=_bonds_from_scm(bonds),
+        bonds=_bonds_from_box(bonds),
     )
 
 
 # Per-molecule property groups whose datasets can be used as targets and whose
 # short names (e.g. "HOMO") are resolved to full "group/dataset" paths.
-_SCM_TARGET_GROUPS = (
+_BOX_TARGET_GROUPS = (
     "energies",
     "exciton_energies",
     "static_multipole_moments",
@@ -448,8 +448,8 @@ _SCM_TARGET_GROUPS = (
 )
 
 
-class SCMMolecularDataset(Dataset):
-    """Per-molecule PyG dataset for the AMS OLED "SCM pure" HDF5 layout.
+class BoxMolecularDataset(Dataset):
+    """Per-molecule PyG dataset for the AMS OLED "box" HDF5 layout.
 
     Each file describes one periodic box containing N molecules (stored as
     per-molecule records, not per-frame trajectories). Every molecule becomes
@@ -477,7 +477,7 @@ class SCMMolecularDataset(Dataset):
     ):
         """
         Args:
-            h5_path: Path to the HDF5 file (SCM pure layout).
+            h5_path: Path to the HDF5 file (box layout).
             target_key: Property key(s) per molecule -- a string, a list, or
                 ``None`` when only box-level access is needed (no targets). A
                 short name (e.g. 'HOMO', 'S1', 'dipole_moment') or a full path
@@ -519,7 +519,7 @@ class SCMMolecularDataset(Dataset):
         with h5py.File(self.h5_path, "r") as hf:
             if "molecules" not in hf or "molecules/atoms" not in hf:
                 raise ValueError(
-                    f"{self.h5_path} is not an SCM pure layout: missing "
+                    f"{self.h5_path} is not a box layout: missing "
                     f"'molecules/atoms' (found groups: {sorted(hf.keys())})"
                 )
             self.target_paths = (
@@ -535,7 +535,7 @@ class SCMMolecularDataset(Dataset):
         if self._has_context:
             self._context_neighbors = self._build_context_neighbors()
             logger.info(
-                "SCMMolecularDataset %s: context mode=%r (radius=%.1f, k=%d) "
+                "BoxMolecularDataset %s: context mode=%r (radius=%.1f, k=%d) "
                 "neighbours precomputed for %d molecule(s)",
                 h5_path,
                 self.context.get("mode", "radius"),
@@ -544,7 +544,7 @@ class SCMMolecularDataset(Dataset):
                 self._num_samples,
             )
         logger.info(
-            "SCMMolecularDataset %s: %d molecule(s), radius=%.3f, targets=%r -> %s, "
+            "BoxMolecularDataset %s: %d molecule(s), radius=%.3f, targets=%r -> %s, "
             "in_memory=%s, context=%s",
             h5_path,
             self._num_samples,
@@ -716,15 +716,15 @@ class SCMMolecularDataset(Dataset):
                 if tk not in hf:
                     raise KeyError(
                         f"target key {tk!r} not found in {self.h5_path}; "
-                        f"known groups: {sorted(_SCM_TARGET_GROUPS)}"
+                        f"known groups: {sorted(_BOX_TARGET_GROUPS)}"
                     )
                 paths.append(tk)
             else:
-                found = [f"{g}/{tk}" for g in _SCM_TARGET_GROUPS if f"{g}/{tk}" in hf]
+                found = [f"{g}/{tk}" for g in _BOX_TARGET_GROUPS if f"{g}/{tk}" in hf]
                 if not found:
                     raise KeyError(
                         f"target key {tk!r} not found in {self.h5_path}; short "
-                        f"names resolve within {sorted(_SCM_TARGET_GROUPS)}"
+                        f"names resolve within {sorted(_BOX_TARGET_GROUPS)}"
                     )
                 if len(found) > 1:
                     raise KeyError(f"target key {tk!r} is ambiguous: {found}")
@@ -1106,7 +1106,7 @@ class SCMMolecularDataset(Dataset):
             data.species_smiles = self._species_smiles[data.species]
 
         logger.debug(
-            "SCM sample idx=%d: %d query atoms, %d context atoms, %d edges, com=%s",
+            "Box sample idx=%d: %d query atoms, %d context atoms, %d edges, com=%s",
             idx,
             data.n_atoms,
             getattr(data, "n_context_atoms", 0),
@@ -1116,26 +1116,26 @@ class SCMMolecularDataset(Dataset):
         return data
 
 
-class CombinedSCMMolecularDataset(Dataset):
-    """A PyTorch Geometric Dataset spanning several SCM-pure HDF5 files.
+class CombinedBoxMolecularDataset(Dataset):
+    """A PyTorch Geometric Dataset spanning several box HDF5 files.
 
-    Combines one :class:`SCMMolecularDataset` per file into a single flat
+    Combines one :class:`BoxMolecularDataset` per file into a single flat
     dataset, so samples behave exactly like the single-file case: each returns
     a ``Data`` with ``x`` (atom types), ``pos``, ``edge_index``, ``y``,
     ``com`` (center of mass), ``lattice``, ``box``, ``mol_name`` and the
     per-molecule properties (orientation, dipoles, species, ...).
 
     Args:
-        h5_paths: A single path or a list of paths to SCM-pure HDF5 files.
+        h5_paths: A single path or a list of paths to box HDF5 files.
         target_key: Property key(s) per molecule -- a string, a list, or ``None``
             when only box-level access is needed (short name or full
             ``group/dataset`` path).
         radius: Radius for the periodic radius-graph construction.
         box_key: Key of the periodic box lattice within each file.
         keep_in_memory: When True, each per-file dataset keeps its HDF5 data in
-            memory (see :class:`SCMMolecularDataset`).
+            memory (see :class:`BoxMolecularDataset`).
         context: Optional per-molecule context configuration forwarded to every
-            per-file dataset (see :class:`SCMMolecularDataset`); when set, each
+            per-file dataset (see :class:`BoxMolecularDataset`); when set, each
             sample's graph also contains the surrounding molecules' atoms.
     """
 
@@ -1163,7 +1163,7 @@ class CombinedSCMMolecularDataset(Dataset):
         # One sub-dataset per file; reuses all per-file loading logic so the
         # combined dataset behaves "in the same way" as the original one.
         self.datasets = [
-            SCMMolecularDataset(
+            BoxMolecularDataset(
                 path,
                 target_key=target_key,
                 radius=radius,
@@ -1182,7 +1182,7 @@ class CombinedSCMMolecularDataset(Dataset):
         self._num_samples = len(self._mapping)
         super().__init__(root=None)
         logger.info(
-            "CombinedSCMMolecularDataset: %d file(s) -> %d sample(s); per-file=%s",
+            "CombinedBoxMolecularDataset: %d file(s) -> %d sample(s); per-file=%s",
             len(self.datasets),
             self._num_samples,
             self.file_counts(),
@@ -1244,7 +1244,7 @@ class CombinedSCMMolecularDataset(Dataset):
     def box_sample(self, box_idx: int, radius: float | None = None) -> Data:
         """One box-level sample (molecules as nodes) from file ``box_idx``.
 
-        Delegates to :meth:`SCMMolecularDataset.box_sample`, so the diffusion
+        Delegates to :meth:`BoxMolecularDataset.box_sample`, so the diffusion
         runner can iterate boxes without a dedicated diffusion dataset class.
         """
         return self.datasets[box_idx].box_sample(radius=radius)
@@ -1254,16 +1254,16 @@ class CombinedSCMMolecularDataset(Dataset):
         return self.datasets[box_idx].box_reference()
 
 
-def get_scm_dataset(
+def get_box_dataset(
     h5_path: str,
     target_key: str | list[str],
     radius: float = 6.0,
     box_key: str = "lattice",
     keep_in_memory: bool = False,
     context: dict | None = None,
-) -> SCMMolecularDataset:
-    """Helper function to instantiate an SCMMolecularDataset."""
-    return SCMMolecularDataset(
+) -> BoxMolecularDataset:
+    """Helper function to instantiate a BoxMolecularDataset."""
+    return BoxMolecularDataset(
         h5_path=h5_path,
         target_key=target_key,
         radius=radius,
@@ -1273,16 +1273,16 @@ def get_scm_dataset(
     )
 
 
-def get_combined_scm_dataset(
+def get_combined_box_dataset(
     h5_paths: str | list[str],
     target_key: str | list[str],
     radius: float = 6.0,
     box_key: str = "lattice",
     keep_in_memory: bool = False,
     context: dict | None = None,
-) -> CombinedSCMMolecularDataset:
-    """Helper function to instantiate a CombinedSCMMolecularDataset."""
-    return CombinedSCMMolecularDataset(
+) -> CombinedBoxMolecularDataset:
+    """Helper function to instantiate a CombinedBoxMolecularDataset."""
+    return CombinedBoxMolecularDataset(
         h5_paths=h5_paths,
         target_key=target_key,
         radius=radius,

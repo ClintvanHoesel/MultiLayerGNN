@@ -27,8 +27,8 @@ from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
 
 from morphology_gnn.data import (
-    CombinedSCMMolecularDataset,
-    SCMMolecularDataset,
+    CombinedBoxMolecularDataset,
+    BoxMolecularDataset,
 )
 from morphology_gnn.model.embedding import EdgeVectorLayer
 from morphology_gnn.model.lightning_trainer import SimpleLightningMoleculeModule
@@ -39,8 +39,8 @@ N_ATOMS = 4  # atoms per molecule in the synthetic box
 NCOL = 3  # columns in the molecule grid
 
 
-def _make_scm_file(path: str, n: int = 6, seed: int = 0) -> str:
-    """Write a small SCM-pure HDF5 file (one box of ``n`` C4 molecules).
+def _make_box_file(path: str, n: int = 6, seed: int = 0) -> str:
+    """Write a small box HDF5 file (one box of ``n`` C4 molecules).
 
     Molecules sit on a 2 x 3 grid (spacing 3.3 A) so neighbours are well
     defined for both the radius and k-NN context selectors, and neighbouring
@@ -80,8 +80,8 @@ def _make_scm_file(path: str, n: int = 6, seed: int = 0) -> str:
 # Dataset: context graphs
 # --------------------------------------------------------------------------- #
 def test_context_all_node_count_and_masking(tmp_path):
-    p = _make_scm_file(str(tmp_path / "box.hdf5"), n=6)
-    ds = SCMMolecularDataset(
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
+    ds = BoxMolecularDataset(
         p, target_key="HOMO", radius=3.0, keep_in_memory=True, context={"mode": "all"}
     )
     assert len(ds) == 6
@@ -103,8 +103,8 @@ def test_context_all_node_count_and_masking(tmp_path):
 
 
 def test_context_radius_and_knn_neighbours(tmp_path):
-    p = _make_scm_file(str(tmp_path / "box.hdf5"), n=6)
-    dsr = SCMMolecularDataset(
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
+    dsr = BoxMolecularDataset(
         p,
         target_key=None,
         radius=3.0,
@@ -118,7 +118,7 @@ def test_context_radius_and_knn_neighbours(tmp_path):
     assert dr.mol_is_query.sum() == N_ATOMS
     assert dr.num_nodes == N_ATOMS + dr.n_context_atoms
 
-    dsk = SCMMolecularDataset(
+    dsk = BoxMolecularDataset(
         p,
         target_key=None,
         radius=3.0,
@@ -131,8 +131,8 @@ def test_context_radius_and_knn_neighbours(tmp_path):
 
 
 def test_context_cross_molecule_edges(tmp_path):
-    p = _make_scm_file(str(tmp_path / "box.hdf5"), n=6)
-    ds = SCMMolecularDataset(
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
+    ds = BoxMolecularDataset(
         p, target_key=None, radius=3.0, keep_in_memory=True, context={"mode": "all"}
     )
     d = ds[0]
@@ -145,9 +145,9 @@ def test_context_cross_molecule_edges(tmp_path):
 
 
 def test_context_batches_and_collates(tmp_path):
-    p1 = _make_scm_file(str(tmp_path / "a.hdf5"), n=6, seed=1)
-    p2 = _make_scm_file(str(tmp_path / "b.hdf5"), n=5, seed=2)
-    ds = CombinedSCMMolecularDataset(
+    p1 = _make_box_file(str(tmp_path / "a.hdf5"), n=6, seed=1)
+    p2 = _make_box_file(str(tmp_path / "b.hdf5"), n=5, seed=2)
+    ds = CombinedBoxMolecularDataset(
         [p1, p2],
         target_key="HOMO",
         radius=3.0,
@@ -184,8 +184,8 @@ def _make_context_model(**kw) -> ScalarMoleculeModel:
 
 
 def test_model_per_molecule_readout_shape_and_backward(tmp_path):
-    p = _make_scm_file(str(tmp_path / "box.hdf5"), n=6)
-    ds = SCMMolecularDataset(
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
+    ds = BoxMolecularDataset(
         p, target_key="HOMO", radius=3.0, keep_in_memory=True, context={"mode": "all"}
     )
     loader = DataLoader(ds, batch_size=4)
@@ -207,8 +207,8 @@ def test_model_per_molecule_readout_shape_and_backward(tmp_path):
 
 
 def test_model_requires_query_mask_with_mol_index(tmp_path):
-    p = _make_scm_file(str(tmp_path / "box.hdf5"), n=6)
-    ds = SCMMolecularDataset(
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
+    ds = BoxMolecularDataset(
         p, target_key=None, radius=3.0, keep_in_memory=True, context={"mode": "all"}
     )
     d = ds[0]
@@ -227,11 +227,11 @@ def test_model_requires_query_mask_with_mol_index(tmp_path):
 
 
 def test_context_affects_query_prediction(tmp_path):
-    p = _make_scm_file(str(tmp_path / "box.hdf5"), n=6)
-    ds_ctx = SCMMolecularDataset(
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=6)
+    ds_ctx = BoxMolecularDataset(
         p, target_key=None, radius=3.0, keep_in_memory=True, context={"mode": "all"}
     )
-    ds_base = SCMMolecularDataset(p, target_key=None, radius=3.0, keep_in_memory=True)
+    ds_base = BoxMolecularDataset(p, target_key=None, radius=3.0, keep_in_memory=True)
     torch.manual_seed(0)
     model = _make_context_model()
     with torch.no_grad():
@@ -280,9 +280,9 @@ def test_edge_layer_pbc_path():
 # End-to-end Lightning step
 # --------------------------------------------------------------------------- #
 def test_context_training_step(tmp_path):
-    p1 = _make_scm_file(str(tmp_path / "a.hdf5"), n=6, seed=1)
-    p2 = _make_scm_file(str(tmp_path / "b.hdf5"), n=6, seed=2)
-    ds = CombinedSCMMolecularDataset(
+    p1 = _make_box_file(str(tmp_path / "a.hdf5"), n=6, seed=1)
+    p2 = _make_box_file(str(tmp_path / "b.hdf5"), n=6, seed=2)
+    ds = CombinedBoxMolecularDataset(
         [p1, p2],
         target_key="HOMO",
         radius=3.0,

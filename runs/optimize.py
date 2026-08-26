@@ -169,7 +169,7 @@ def _suggest(space: dict, trial: optuna.Trial) -> dict:
 def _get_dataset(config: dict):
     """Build (and cache) the scalar-regression dataset for one trial.
 
-    Cache key includes the dataset layout so molecular and SCM-pure builds of
+    Cache key includes the dataset layout so molecular and box builds of
     the same files/targets/radius do not collide.
     """
     files = config["data"]
