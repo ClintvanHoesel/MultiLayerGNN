@@ -602,6 +602,11 @@ class SCMMolecularDataset(Dataset):
                 if "pairs/indices" in hf
                 else None
             )
+            cache["energies"] = {
+                energy: torch.tensor(hf[f"energies/{energy}"][:], dtype=torch.float)
+                for energy in ("IP", "EA", "HOMO", "LUMO", "HOMO-1", "LUMO+1")
+                if f"energies/{energy}" in hf
+            }
             cache["transfer_integrals"] = {
                 carrier: torch.tensor(
                     hf[f"transfer_integrals/{carrier}"][:], dtype=torch.float
@@ -633,6 +638,7 @@ class SCMMolecularDataset(Dataset):
                 "targets": [
                     c["targets"][p][idx].reshape(-1) for p in self.target_paths
                 ],
+                "energies": [c["energies"][p][idx].reshape(-1) for p in c["energies"]],
                 "dipole_moment": (
                     None if c["dipole_moment"] is None else c["dipole_moment"][idx]
                 ),
@@ -678,6 +684,13 @@ class SCMMolecularDataset(Dataset):
                     else None
                 ),
             }
+            for field in ("IP", "EA", "HOMO", "LUMO", "HOMO-1", "LUMO-1"):
+                path = f"energy/{field}"
+                row[f"transition_dipole_{field}"] = (
+                    torch.tensor(hf[path][idx], dtype=torch.float)
+                    if path in hf
+                    else None
+                )
             for field in ("S1_S0", "T1_S0"):
                 path = f"transition_dipole_moments/{field}"
                 row[f"transition_dipole_{field}"] = (
@@ -981,9 +994,10 @@ class SCMMolecularDataset(Dataset):
         Returns ``(pos, types, n_per, mol_index, mol_is_query)``:
         ``pos`` ``(N, 3)`` box-frame coordinates of every included atom,
         ``types`` ``(N,)`` atomic numbers, ``n_per`` the number of atoms per
-        molecule (query first), ``mol_index`` ``(N,)`` the molecule id each node
-        belongs to (query = 0, context = 1..C) and ``mol_is_query`` a boolean
-        mask over nodes that is True only for the query molecule's atoms.
+        molecule (query first), ``mol_index`` ``(N,)`` the actual molecule id
+        each node belongs to (query = ``idx``, context = the neighbour molecule
+        indices) and ``mol_is_query`` a boolean mask over nodes that is True
+        only for the query molecule's atoms.
         """
         neighbors = self._context_neighbors[idx]
         blocks = [np.asarray(row["atoms"])] + [self._atoms_list()[j] for j in neighbors]
@@ -1002,7 +1016,11 @@ class SCMMolecularDataset(Dataset):
             dtype=torch.long,
         )
         pos = torch.tensor(xyz, dtype=torch.float)
-        mol_index = torch.arange(len(blocks)).repeat_interleave(
+        # Actual molecule ids per node: the query is molecule ``idx``, each
+        # context block belongs to its neighbour molecule index (the same ``j``
+        # as in ``neighbors``).
+        mol_ids = [idx] + list(neighbors)
+        mol_index = torch.tensor(mol_ids, dtype=torch.long).repeat_interleave(
             torch.tensor(n_per, dtype=torch.long)
         )
         mol_is_query = torch.zeros(pos.shape[0], dtype=torch.bool)
