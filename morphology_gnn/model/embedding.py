@@ -62,7 +62,7 @@ class DistanceEmbedding(torch.nn.Module):
     def __init__(
         self,
         num_rbf: int = 50,
-        rbf_class: type[AbstractRBF] | AbstractRBF = GaussianRBF,
+        rbf_class: type[AbstractRBF] | AbstractRBF | str = GaussianRBF,
         cutoff_lower: float = 0.0,
         cutoff_upper: float = 5.0,
         trainable: bool = True,

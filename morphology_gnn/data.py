@@ -1069,7 +1069,12 @@ class SCMMolecularDataset(Dataset):
 
         data = Data(x=types.unsqueeze(-1), pos=pos, edge_index=edge_index, y=y)
         data.lattice = lattice
-        data.box = torch.diagonal(lattice).reshape(1, 3).clone()
+        box, is_orthorhombic = _normalize_lattice(lattice)
+        if is_orthorhombic:
+            # Store as (1, 3) so PyG batching collates it to (B, 3); a bare
+            # (3,) vector would collate to (B*3,), which breaks `box[batch]`
+            # in the model's PBC minimum-image edge path.
+            data.box = box.reshape(1, 3).clone()
         data.mol_name = str(idx)
         data.n_atoms = n_query_atoms
         if mol_index is not None:
