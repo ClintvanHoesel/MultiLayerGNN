@@ -194,7 +194,8 @@ class ScalarMoleculeModel(torch.nn.Module):
         # Graph-level prediction head: one output per target property. The input
         # dim follows the (possibly multi) aggregation output width.
         self.num_targets = num_targets
-        self.lin = nn.Linear(self._aggr_out_dim, num_targets)
+        self.lin = nn.Linear(self._aggr_out_dim, self.hidden_dim)
+        self.lin2 = nn.Linear(self.hidden_dim, num_targets)
 
     @staticmethod
     def _resolve_norm(residual_kwargs: dict, hidden_dim: int) -> None:
@@ -229,6 +230,7 @@ class ScalarMoleculeModel(torch.nn.Module):
         for conv in self.convs:
             conv.reset_parameters()
         self.lin.reset_parameters()
+        self.lin2.reset_parameters()
 
     def forward(
         self,
@@ -318,7 +320,10 @@ class ScalarMoleculeModel(torch.nn.Module):
             mol_key = mol_index + batch * mol_stride  # unique (sample, molecule)
             x = self.global_aggr(x, mol_key)  # (total_mol, hidden_dim)
             x = F.dropout(x, p=self.dropout, training=self.training)
-            pred = self.lin(x)  # (total_mol, num_targets)
+            # Same two-layer prediction head as the graph-level path below.
+            x = self.lin(x)  # (total_mol, hidden_dim)
+            x = self.act(x)
+            pred = self.lin2(x)  # (total_mol, num_targets)
             if mol_is_query is None:
                 raise ValueError(
                     "mol_is_query is required when mol_index is given (context "
@@ -336,5 +341,7 @@ class ScalarMoleculeModel(torch.nn.Module):
             return pred[query_per_mol]  # (batch_size, num_targets)
 
         x = self.global_aggr(x, batch)  # (batch_size, hidden_dim)
+        x = self.lin(x)  # (batch_size, hidden_dim)
+        x = self.act(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
-        return self.lin(x)  # (batch_size, num_targets)
+        return self.lin2(x)  # (batch_size, num_targets)
