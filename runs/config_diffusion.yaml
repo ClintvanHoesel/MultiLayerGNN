@@ -14,9 +14,12 @@
 #   --diffusion.schedule linear
 #   --sampling.steps 50 --sampling.ddim true
 
-# Dataset layout: "box" (boxes of molecules, COM positions) or
-# "molecular" (per-frame MD *_ams.hdf5, per-atom positions).
-dataset: box
+# Dataset layout: "box" (boxes of molecules, COM positions; one sample per
+# box) or "box_zordered" (per-molecule z-ordered samples: the studied molecule
+# + everything at/below its z with a target_mask, so the train/val/test split
+# draws random molecules across the film) or "molecular" (per-frame MD
+# *_ams.hdf5, per-atom positions).
+dataset: box_zordered
 
 # One or more box HDF5 files (one periodic box per file).
 data:
@@ -33,8 +36,8 @@ target: null
 radius: 20.0
 
 # Keep the box HDF5 data resident in memory: load it once at dataset
-# construction instead of re-reading the file on every accessor call. Only
-# affects `dataset: box` (CombinedBoxMolecularDataset). CLI: --keep_in_memory.
+# construction instead of re-reading the file on every accessor call. Affects
+# `dataset: box` / `dataset: box_zordered`. CLI: --keep_in_memory.
 keep_in_memory: true
 
 # CUDA / hardware knobs.
@@ -50,7 +53,7 @@ model:
   num_layers: 2
   # Attention heads (only used when conv_class is GATConv).
   heads: 4
-  num_rbf: 50
+  num_rbf: 64
   # The message-passing backbone must accept an `edge_dim` argument (GATConv,
   # TransformerConv, ...); it consumes the RBF min-image edge features.
   conv_class: GATConv
@@ -104,6 +107,11 @@ training:
   scheduler_kwargs: {}
   scheduler_monitor: val_loss
   scheduler_interval: epoch
+  # Sequential (+z) training: the studied (target) molecule of each sample is
+  # noised while the molecules below it (context) stay clean, with the loss over
+  # the target. null = auto: true for dataset=box_zordered (per-molecule samples
+  # with a target_mask); false keeps the original whole-box corruption.
+  z_ordered: null
 
 sampling:
   # Number of reverse-diffusion steps used when generating structures.
@@ -117,6 +125,26 @@ sampling:
   # How many reference frames per split to condition generation on.
   num_reference: 4
   seed: 0
+
+# Generation strategy. mode "full" keeps the original whole-structure sampler
+# (all molecules reverse-diffused simultaneously). mode "sequential_z" generates
+# the molecules point-by-point in +z: each new molecule is reverse-diffused with
+# the structure-so-far frozen in the graph as context, and its COM z is
+# constrained to stay at/above the current z-frontier at every sampling step.
+# dataset=box_zordered trains the sequential conditional model, so it pairs
+# with generation.mode=sequential_z (the runner warns otherwise).
+generation:
+  mode: sequential_z
+  # Number of molecules to generate sequentially (default: the reference
+  # molecule count, so the generated shape matches the truth for metrics).
+  num_points: null
+  # Minimum z (Angstrom) below which no molecule is generated — the excluded
+  # bottom layer. Always: generated_z >= bottom_z_exclusion.
+  bottom_z_exclusion: 0.0
+  # Optional minimum z separation between consecutive molecules (0 = the model
+  # freely chooses the spacing, constrained only to stay at/above the current
+  # z-frontier).
+  z_step: 0.0
 
 logging:
   outdir: runs/artifacts_diffusion

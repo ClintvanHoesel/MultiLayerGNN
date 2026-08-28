@@ -110,7 +110,7 @@ model:
   cutoff_fn: null
   # Extra constructor kwargs for the cutoff envelope (e.g. PolynomialEnvelope
   # `exponent`). model.rbf_kwargs.cutoff_fn_kwargs overrides this.
-  cutoff_fn_kwargs: {accumulate_grad_batches: 8}
+  cutoff_fn_kwargs: {accumulate_grad_batches: 4}
   # Whether to wrap each conv layer in a Residual connection.
   use_residual: true
   # Normalization type applied inside the residual wrapper (first-class knob).
@@ -166,8 +166,8 @@ model:
 
 training:
   batch_size: 1
-  lr: 0.01
-  weight_decay: 0.0001
+  lr: 0.001
+  weight_decay: 0.0000001
   max_epochs: 1000
   patience: 50
   val_frac: 0.1

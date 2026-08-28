@@ -45,6 +45,7 @@ from torch_geometric.nn import GATConv  # noqa: E402
 from morphology_gnn.data import (  # noqa: E402
     CombinedH5MolecularDataset,
     CombinedBoxMolecularDataset,
+    ZOrderedBoxMolecularDataset,
 )
 from morphology_gnn.model.diffusion_model import DiffusionMoleculeModel  # noqa: E402
 from morphology_gnn.model.diffusion_trainer import (  # noqa: E402
@@ -91,8 +92,11 @@ log = logging.getLogger("morphology_gnn.runs.run_diffusion")
 DEFAULT_CONFIG = {
     "data": ["data/2-TNATA_ams.hdf5"],
     # Dataset layout: "molecular" (per-frame MD *_ams.hdf5 files; the model
-    # generates per-atom positions) or "box" (box samples; the model then
-    # generates the N molecule center-of-mass positions, ``molecules/position``).
+    # generates per-atom positions), "box" (box samples; the model generates
+    # the N molecule center-of-mass positions, ``molecules/position``, one
+    # sample per box) or "box_zordered" (per-molecule z-ordered samples: the
+    # studied molecule + everything at/below its z, with a target_mask, so the
+    # train/val/test split draws random molecules across the film).
     "dataset": "molecular",
     # Target property key(s). Required by the dataset loader, but UNUSED by the
     # diffusion model (no property conditioning).
@@ -138,6 +142,13 @@ DEFAULT_CONFIG = {
         "scheduler_kwargs": {},
         "scheduler_monitor": "val_loss",
         "scheduler_interval": "epoch",
+        # Sequential (+z) training: every sample's molecules are split at a
+        # z-frontier — the lower ones stay clean (t=0, context) and only the
+        # upper ones are noised, with the loss over those targets. This makes
+        # training match generation.mode=sequential_z. None = auto: True for
+        # dataset=box_zordered (per-molecule samples with a target_mask), else
+        # the original whole-box corruption.
+        "z_ordered": None,
         # Free-form PyTorch Lightning Trainer kwargs (anything pl.Trainer
         # accepts), e.g. accumulate_grad_batches, precision, overfit_batches,
         # limit_train_batches, num_sanity_val_steps... Passed straight to
@@ -172,6 +183,25 @@ DEFAULT_CONFIG = {
         "num_reference": 4,
         "seed": 0,
     },
+    # Generation strategy. mode "full" keeps the original whole-structure
+    # sampler (all molecules reverse-diffused simultaneously). mode
+    # "sequential_z" generates the molecules point-by-point in +z: each new
+    # molecule is reverse-diffused with the structure-so-far frozen in the
+    # graph as context, and its COM z is constrained to stay at/above the
+    # current z-frontier at every sampling step. Training is unaffected.
+    "generation": {
+        "mode": "full",
+        # Number of molecules to generate sequentially (default: the reference
+        # molecule count, so the generated shape matches the truth for metrics).
+        "num_points": None,
+        # Minimum z (Angstrom) below which no molecule is generated — the
+        # excluded bottom layer. Always: generated_z >= bottom_z_exclusion.
+        "bottom_z_exclusion": 0.0,
+        # Optional minimum z separation between consecutive molecules (0 = the
+        # model freely chooses the spacing, constrained only to stay at/above
+        # the current z-frontier).
+        "z_step": 0.0,
+    },
     "logging": {
         "outdir": "runs/artifacts_diffusion",
         "wandb_project": None,
@@ -188,7 +218,7 @@ DEFAULT_CONFIG = {
 FLAG_DEFS = [
     ("data", "data", dict(nargs="+")),
     ("radius", "radius", dict(type=float)),
-    ("dataset", "dataset", dict(choices=["molecular", "box"])),
+    ("dataset", "dataset", dict(choices=["molecular", "box", "box_zordered"])),
     (
         "keep_in_memory",
         "keep_in_memory",
@@ -223,6 +253,11 @@ FLAG_DEFS = [
     ("sampling_eta", "sampling.eta", dict(type=float)),
     ("num_samples", "sampling.num_samples", dict(type=int)),
     ("num_reference", "sampling.num_reference", dict(type=int)),
+    ("z_ordered", "training.z_ordered", dict(action="store_true", default=None)),
+    ("generation_mode", "generation.mode", dict(choices=["full", "sequential_z"])),
+    ("num_points", "generation.num_points", dict(type=int)),
+    ("bottom_z_exclusion", "generation.bottom_z_exclusion", dict(type=float)),
+    ("z_step", "generation.z_step", dict(type=float)),
     ("outdir", "logging.outdir", {}),
     ("wandb_project", "logging.wandb_project", {}),
     ("run_name", "logging.run_name", {}),
@@ -400,6 +435,14 @@ def build_diffusion_module(model, config: dict) -> DiffusionMoleculeModule:
     kw["sample_steps"] = sampling_cfg.get("steps", 100)
     kw["sample_ddim"] = sampling_cfg.get("ddim", False)
     kw["sample_eta"] = sampling_cfg.get("eta", 0.0)
+    # The box_zordered dataset provides per-molecule samples with a target_mask
+    # (the studied molecule; context = molecules at/below its z), so z-ordered
+    # training is the natural fit — enabled automatically unless overridden
+    # (z_ordered: None in the resolved config means "auto").
+    z_ordered = train_cfg.get("z_ordered")
+    if z_ordered is None:
+        z_ordered = config.get("dataset") == "box_zordered"
+    kw["z_ordered"] = bool(z_ordered)
     kw["config"] = config
     return DiffusionMoleculeModule(model, **kw)
 
@@ -433,6 +476,14 @@ class BoxDataset(Dataset):
         """Molecule identifier per sample: one box per file, file-qualified."""
         return [f"{di}:{ds.mol_name}" for di, ds in enumerate(self.molecular.datasets)]
 
+    def n_boxes(self) -> int:
+        """Number of boxes (files)."""
+        return self.molecular.n_boxes()
+
+    def box_sample(self, idx: int = 0, radius: float | None = None) -> Data:
+        """Full-box sample (molecules as nodes) for generation."""
+        return self.molecular.box_sample(idx, radius=radius or self.radius)
+
     def box_reference(self, idx: int = 0) -> dict:
         """Per-molecule reference metadata for the box at flat index ``idx``."""
         return self.molecular.box_reference(idx)
@@ -443,9 +494,13 @@ def build_dataset(config: dict):
 
     ``dataset: molecular`` -> per-frame MD files (:class:`CombinedH5MolecularDataset`,
     per-atom positions). ``dataset: box`` -> box samples via
-    :class:`BoxDataset` over :class:`CombinedBoxMolecularDataset`
-    (molecule center-of-mass positions). The target is unused by the diffusion
-    model, so the box dataset is built with ``target_key=None``.
+    :class:`BoxDataset` over :class:`CombinedBoxMolecularDataset` (molecule
+    center-of-mass positions; one sample per box). ``dataset: box_zordered`` ->
+    per-molecule samples via :class:`ZOrderedBoxMolecularDataset`: each sample
+    is the studied molecule + everything at/below its z (with a ``target_mask``),
+    so the train/val/test split draws random molecules across the film and the
+    trainer needs no internal z-frontier. The target is unused by the diffusion
+    model, so the box datasets are built with ``target_key=None``.
     """
     data_files = config["data"]
     if isinstance(data_files, str):
@@ -458,6 +513,12 @@ def build_dataset(config: dict):
             keep_in_memory=config.get("keep_in_memory", False),
         )
         return BoxDataset(molecular, radius=config["radius"])
+    if config.get("dataset") == "box_zordered":
+        return ZOrderedBoxMolecularDataset(
+            data_files,
+            radius=config["radius"],
+            keep_in_memory=config.get("keep_in_memory", False),
+        )
     return CombinedH5MolecularDataset(
         data_files, config["target"], radius=config["radius"]
     )
@@ -473,7 +534,11 @@ def _make_run_name(config: dict) -> str:
     conv = str(model.get("conv_class", "GATConv")).rsplit(".", 1)[-1]
     parts = [
         "diff",
-        "box" if config.get("dataset") == "box" else "mol",
+        (
+            "zbox"
+            if config.get("dataset") == "box_zordered"
+            else "box" if config.get("dataset") == "box" else "mol"
+        ),
         conv,
         f"h{model.get('hidden_dim', 128)}",
         f"l{model.get('num_layers', 2)}",
@@ -575,8 +640,17 @@ def reconstruct_box_atoms(box_ref: dict, gen_com: torch.Tensor, box: torch.Tenso
     return symbols, torch.stack(pos_list) if pos_list else None
 
 
-def evaluate_generation(module, loader, sampling_cfg: dict, device):
+def evaluate_generation(
+    module, loader, sampling_cfg: dict, device, generation_cfg: dict | None = None
+):
     """Generate conformations conditioned on a few reference frames.
+
+    ``generation_cfg`` (optional, default empty) selects the generation
+    strategy: ``mode: "full"`` uses the original whole-structure sampler
+    (:meth:`DiffusionMoleculeModule.sample_many`); ``mode: "sequential_z"``
+    uses the point-by-point +z sampler
+    (:meth:`DiffusionMoleculeModule.sample_sequential_z_many`) with
+    ``num_points`` / ``bottom_z_exclusion`` / ``z_step``.
 
     Returns ``(metrics, refs)``: aggregated position metrics and per-reference
     artifacts (atom types, cell, truth positions, generated structures,
@@ -584,30 +658,67 @@ def evaluate_generation(module, loader, sampling_cfg: dict, device):
     """
     import statistics
 
+    generation_cfg = generation_cfg or {}
+    gen_mode = generation_cfg.get("mode", "full")
+
     ds = loader.dataset
     # Generation may run over a torch.utils.data.Subset (train/val/test split);
-    # unwrap to the base dataset so per-molecule reference metadata (box) is
-    # available for full-box reconstruction.
-    base, subset_indices = ds, None
+    # unwrap to the base dataset so box-level reference metadata is available
+    # for full-box reconstruction.
+    base, _subset_indices = ds, None
     while isinstance(base, torch.utils.data.Subset):
-        subset_indices = base.indices
         base = base.dataset
     has_box_ref = hasattr(base, "box_reference")
 
-    num_ref = min(int(sampling_cfg.get("num_reference", 4)), len(ds))
     num_samples = int(sampling_cfg.get("num_samples", 8))
     base_seed = sampling_cfg.get("seed", 0)
+
+    if gen_mode == "sequential_z" and not has_box_ref:
+        log.warning(
+            "generation.mode=sequential_z orders the graph nodes by z; with "
+            "dataset:molecular the nodes are atoms, not molecules — make sure "
+            "that is the intended behaviour (sequential_z is designed for the "
+            "molecules-as-nodes box representation)"
+        )
+
+    if has_box_ref:
+        # Box-based datasets (box / box_zordered) are generated per BOX — the
+        # whole thin film — not per per-molecule training sample. The loader
+        # split is per-molecule, so the reference boxes come from the base
+        # dataset (full boxes).
+        n_boxes = base.n_boxes() if hasattr(base, "n_boxes") else len(base)
+        num_ref = min(int(sampling_cfg.get("num_reference", 4)), n_boxes)
+        ref_indices = list(range(num_ref))
+    else:
+        num_ref = min(int(sampling_cfg.get("num_reference", 4)), len(ds))
+        ref_indices = None
 
     all_rms, all_rdf_mad, all_min = [], [], []
     refs = []
     for i in range(num_ref):
-        data = ds[i].to(device)
+        if has_box_ref:
+            data = base.box_sample(ref_indices[i]).to(device)
+        else:
+            data = ds[i].to(device)
         atoms = data.x.squeeze(-1)
         cell = data.box.squeeze(0)  # (3,)
         truth = data.pos
-        gen = module.sample_many(
-            atoms, cell, n=num_samples, seed=(base_seed or 0) + i * 1000
-        )  # (n, N, 3)
+        if gen_mode == "sequential_z":
+            num_points = generation_cfg.get("num_points")
+            num_points = int(atoms.shape[0]) if num_points is None else int(num_points)
+            gen = module.sample_sequential_z_many(
+                atoms,
+                cell,
+                n=num_samples,
+                seed=(base_seed or 0) + i * 1000,
+                num_points=num_points,
+                bottom_z_exclusion=generation_cfg.get("bottom_z_exclusion", 0.0),
+                z_step=generation_cfg.get("z_step", 0.0),
+            )  # (n, num_points, 3)
+        else:
+            gen = module.sample_many(
+                atoms, cell, n=num_samples, seed=(base_seed or 0) + i * 1000
+            )  # (n, N, 3)
 
         rms = [coord_rmse(g, truth).item() for g in gen]
         truth_hist, edges = pair_correlation(truth, cell)
@@ -629,10 +740,9 @@ def evaluate_generation(module, loader, sampling_cfg: dict, device):
             "edges": edges.cpu(),
         }
         if has_box_ref:
-            orig_idx = subset_indices[i] if subset_indices is not None else i
-            # `base` is statically a PyG Dataset; box_reference only exists on the
-            # box dataset (guarded by has_box_ref above).
-            ref["box_ref"] = getattr(base, "box_reference")(orig_idx)
+            # `base` is statically a PyG Dataset; box_reference only exists on
+            # the box datasets (guarded by has_box_ref above).
+            ref["box_ref"] = getattr(base, "box_reference")(ref_indices[i])
         refs.append(ref)
 
     metrics = {
@@ -789,17 +899,44 @@ def main() -> None:
         if len(test_loader) > 0:
             trainer.test(module, test_loader)
 
-        # 4. Generation evaluation. With box data there are only a few boxes per
-        #    dataset, so evaluate generation on every box (total) rather than on
-        #    possibly-empty val/test splits.
+        # 4. Generation evaluation. Box-based datasets (box / box_zordered) have
+        #    a full-box generation reference; with the per-molecule z-ordered
+        #    dataset the train/val/test split is per-molecule (random molecules
+        #    across the film), so generation is evaluated on every box (total)
+        #    rather than on the possibly-empty val/test box list.
         device = next(module.parameters()).device
         gen_metrics = {}
         eval_loaders = [("val", val_loader), ("test", test_loader)]
-        if config.get("dataset") == "box" or all(len(l) == 0 for _, l in eval_loaders):
+        if config.get("dataset") in ("box", "box_zordered") or all(
+            len(l) == 0 for _, l in eval_loaders
+        ):
             eval_loaders = [("total", total_loader)]
+        if (
+            config.get("generation", {}).get("mode") == "sequential_z"
+            and not config.get("training", {}).get("z_ordered", False)
+        ):
+            log.warning(
+                "generation.mode=sequential_z but training.z_ordered is False — "
+                "the model was not trained for point-by-point z-ordered "
+                "generation. Enable training.z_ordered: true so the training "
+                "corruption matches the sequential sampling distribution."
+            )
+        if config.get("dataset") == "box_zordered" and config.get(
+            "generation", {}
+        ).get("mode", "full") != "sequential_z":
+            log.warning(
+                "dataset=box_zordered trains the point-by-point (+z) conditional "
+                "model; generation.mode is %r — consider "
+                "generation.mode=sequential_z so sampling matches training.",
+                config.get("generation", {}).get("mode", "full"),
+            )
         for split, loader in eval_loaders:
             metrics, refs = evaluate_generation(
-                module, loader, config["sampling"], device
+                module,
+                loader,
+                config["sampling"],
+                device,
+                generation_cfg=config.get("generation", {}),
             )
             for k, v in metrics.items():
                 gen_metrics[f"gen_{split}_{k}"] = v

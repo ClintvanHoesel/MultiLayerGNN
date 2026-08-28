@@ -1254,6 +1254,135 @@ class CombinedBoxMolecularDataset(Dataset):
         return self.datasets[box_idx].box_reference()
 
 
+class ZOrderedBoxMolecularDataset(Dataset):
+    """Per-molecule diffusion samples for sequential (+z) film generation.
+
+    Built on :class:`CombinedBoxMolecularDataset` (which in turn is built on
+    :class:`BoxMolecularDataset`). Every molecule of every box becomes one
+    sample: the *studied* molecule (the target) plus every molecule whose
+    center-of-mass z is **at or below** its z — all molecules higher in z than
+    the studied molecule are thrown away. The returned ``Data`` is a graph of
+    the kept molecule COMs (nodes = molecules) with a per-node ``target_mask``
+    (True only for the studied molecule), so the diffusion trainer never has to
+    invent a z-frontier itself: it simply keeps the context nodes clean and
+    denoises the target (see ``DiffusionMoleculeModule._corrupt_z_ordered``).
+
+    Because every molecule is a sample, the standard random train/val/test split
+    (``runs.training_helpers.build_loaders``) draws random molecules across the
+    whole film — the validation and test sets are not restricted to a z-slab of
+    the box.
+
+    For generation, :meth:`box_sample` / :meth:`box_reference` expose the full
+    box (all molecules) so a whole new thin film can be generated/reconstructed.
+    """
+
+    def __init__(
+        self,
+        h5_paths: str | list[str],
+        radius: float = 20.0,
+        box_key: str = "lattice",
+        keep_in_memory: bool = False,
+    ) -> None:
+        if isinstance(h5_paths, str):
+            h5_paths = [h5_paths]
+        self.h5_paths = list(h5_paths)
+        self.radius = radius
+        self.box_key = box_key
+
+        self.molecular = CombinedBoxMolecularDataset(
+            self.h5_paths,
+            target_key=None,
+            radius=radius,
+            box_key=box_key,
+            keep_in_memory=keep_in_memory,
+        )
+        # Precompute per-file COMs, species and lattice once (cheap accessors).
+        self._coms = [ds.coms() for ds in self.molecular.datasets]
+        self._species = [ds.species_ids() for ds in self.molecular.datasets]
+        self._lattices = [ds.lattice for ds in self.molecular.datasets]
+        self._mapping = [
+            (fi, mi)
+            for fi, ds in enumerate(self.molecular.datasets)
+            for mi in range(len(ds))
+        ]
+        self._num_samples = len(self._mapping)
+        super().__init__(root=None)
+        logger.info(
+            "ZOrderedBoxMolecularDataset: %d molecule(s) over %d file(s), "
+            "radius=%.3f (per-molecule samples; context = molecules at/below "
+            "the studied molecule's z)",
+            self._num_samples,
+            len(self.molecular.datasets),
+            radius,
+        )
+
+    def __len__(self) -> int:
+        return self._num_samples
+
+    def mol_ids(self) -> list[str]:
+        """Molecule identifier per sample (file-qualified molecule index)."""
+        return [f"{fi}:{mi}" for fi, mi in self._mapping]
+
+    def n_boxes(self) -> int:
+        """Number of boxes (files) — used by the runner for generation."""
+        return self.molecular.n_boxes()
+
+    def box_sample(self, box_idx: int = 0, radius: float | None = None) -> Data:
+        """Full-box sample (all molecules) used as generation reference/truth."""
+        return self.molecular.box_sample(box_idx, radius=radius)
+
+    def box_reference(self, box_idx: int = 0) -> dict:
+        """Per-molecule reference metadata of the box (generation eval / viz)."""
+        return self.molecular.box_reference(box_idx)
+
+    def __getitem__(self, idx: int) -> Data:
+        """One z-ordered sample: the studied molecule + everything at/below its z.
+
+        Returns a ``Data`` of the kept molecule COMs with a PBC radius graph,
+        ``box``/``lattice``, and a per-node ``target_mask`` marking exactly the
+        studied molecule. Molecules higher in z than the studied molecule are
+        thrown away — they are the ones the model must learn to generate later.
+        """
+        fi, mi = self._mapping[idx]
+        coms = self._coms[fi]  # (N, 3)
+        species = self._species[fi]  # (N,)
+        lattice = self._lattices[fi]
+        z = coms[:, 2]
+        # Throw away every molecule higher in z than the studied molecule; keep
+        # the studied molecule and everything at/below its z.
+        keep = z <= z[mi]
+        kept = torch.nonzero(keep).flatten()  # (k,)
+        pos = coms[kept]
+        x = species[kept].reshape(-1, 1)
+        edge_index = try_cuda_radius_graph_pbc(
+            pos, r=self.radius, lattice=lattice, loop=False
+        )
+        box, is_orthorhombic = _normalize_lattice(lattice)
+        target_mask = kept == mi  # (k,) bool — True only for the studied molecule
+        data = Data(x=x, pos=pos, edge_index=edge_index, y=torch.zeros(1))
+        data.box = box.reshape(1, 3).clone()
+        data.lattice = lattice.clone()
+        data.is_orthorhombic = torch.tensor([int(is_orthorhombic)], dtype=torch.long)
+        data.target_mask = target_mask
+        data.mol_name = self.mol_ids()[idx]
+        return data
+
+
+def get_z_ordered_box_dataset(
+    h5_paths: str | list[str],
+    radius: float = 20.0,
+    box_key: str = "lattice",
+    keep_in_memory: bool = False,
+) -> ZOrderedBoxMolecularDataset:
+    """Helper function to instantiate a ZOrderedBoxMolecularDataset."""
+    return ZOrderedBoxMolecularDataset(
+        h5_paths=h5_paths,
+        radius=radius,
+        box_key=box_key,
+        keep_in_memory=keep_in_memory,
+    )
+
+
 def get_box_dataset(
     h5_path: str,
     target_key: str | list[str],

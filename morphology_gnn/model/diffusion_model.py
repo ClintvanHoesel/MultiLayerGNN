@@ -449,7 +449,7 @@ class DiffusionMoleculeModel(nn.Module):
                 edge_index.shape[1],
                 int(batch.max()) + 1 if batch.numel() else 0,
             )
-        t_node = t[batch]  # (N,)
+        t_node = t[batch]  # (N,) — every node of a graph shares its graph's t
         box_node = box[batch]  # (N, 3)
         h = self.atom_emb(x) + self.time_emb(t_node) + self.cell_emb(box_node)
 
