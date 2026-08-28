@@ -110,7 +110,7 @@ model:
   cutoff_fn: null
   # Extra constructor kwargs for the cutoff envelope (e.g. PolynomialEnvelope
   # `exponent`). model.rbf_kwargs.cutoff_fn_kwargs overrides this.
-  cutoff_fn_kwargs: {accumulate_grad_batches: 4}
+  cutoff_fn_kwargs: {}
   # Whether to wrap each conv layer in a Residual connection.
   use_residual: true
   # Normalization type applied inside the residual wrapper (first-class knob).
@@ -187,7 +187,7 @@ training:
   # limit_train_batches, num_sanity_val_steps... Passed straight to
   # pl.Trainer(**trainer_kwargs(training)). CLI deep overrides work per key:
   #   --training.trainer_kwargs.accumulate_grad_batches 4
-  trainer_kwargs: {}
+  trainer_kwargs: {accumulate_grad_batches: 4}
   # Gradient clipping (PyTorch Lightning Trainer kwargs). These are folded into
   # `trainer_kwargs` at Trainer build time, so the equivalent keys can also be
   # set there (which takes precedence). Set gradient_clip_val to a positive
