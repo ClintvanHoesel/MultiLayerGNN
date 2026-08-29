@@ -97,6 +97,13 @@ def test_noise_schedule_unknown_kind():
         NoiseSchedule("nope")
 
 
+@pytest.mark.parametrize("kind", ["cosine", "linear"])
+def test_noise_schedule_time_from_sigma_inverts_sigma(kind):
+    schedule = NoiseSchedule(kind)
+    sigma = torch.linspace(0.0, 1.0, 17)
+    assert torch.allclose(schedule.sigma(schedule.time_from_sigma(sigma)), sigma)
+
+
 # --------------------------------------------------------------------------- #
 # Pair correlation function
 # --------------------------------------------------------------------------- #
@@ -341,6 +348,53 @@ def test_corrupt_in_cell():
     assert eps.shape == b.pos.shape
     box_node = module._batch_box(b)[b.batch]
     assert (x_noisy >= -1e-6).all() and (x_noisy < box_node + 1e-6).all()
+
+
+def test_noise_scale_per_axis():
+    """A length-3 noise_scale applies per-axis (x, y, z) noise amplitudes."""
+    module = DiffusionMoleculeModule(
+        _small_model(), radius=4.0, noise_scale=[4.0, 4.0, 0.5]
+    )
+    box = torch.tensor([[20.0, 20.0, 10.0]])
+    box_node = box.expand(2, -1)
+    scale = module._noise_scale_node(box_node)
+    assert scale.shape == (2, 3)
+    expected = torch.tensor([[4.0, 4.0, 0.5], [4.0, 4.0, 0.5]])
+    assert torch.equal(scale, expected)
+    assert torch.equal(module._noise_scale_vec(box[0]), expected[0])
+
+    # A scalar still expands to all three axes; None keeps the box.
+    scalar = DiffusionMoleculeModule(_small_model(), radius=4.0, noise_scale=2.0)
+    assert scalar.noise_scale == (2.0, 2.0, 2.0)
+    unscaled = DiffusionMoleculeModule(_small_model(), radius=4.0, noise_scale=None)
+    assert unscaled.noise_scale is None
+    assert torch.equal(unscaled._noise_scale_node(box_node), box_node)
+
+    # A wrong-length sequence must be rejected.
+    with pytest.raises(ValueError):
+        DiffusionMoleculeModule(_small_model(), radius=4.0, noise_scale=[1.0, 2.0])
+
+
+def test_periodic_noise_target_reconstructs_clean_position():
+    """Cell-scale wrapping does not make the VE denoising target ambiguous."""
+    module = DiffusionMoleculeModule(_small_model(), radius=4.0)
+    box = torch.tensor([[10.0, 8.0, 12.0]])
+    box_node = box.expand(2, -1)
+    x0 = torch.tensor([[1.0, 2.0, 3.0], [9.0, 7.0, 11.0]])
+    sigma_node = torch.tensor([[0.8], [0.8]])
+    # Deliberately cross several periodic images before wrapping.
+    raw_eps = torch.tensor([[2.3, -1.7, 0.4], [-1.2, 1.8, -2.1]])
+    x_noisy = torch.remainder(x0 + sigma_node * box_node * raw_eps, box_node)
+
+    # Default noise scale == box (module.noise_scale is None), so amplitude and
+    # wrapping period coincide.
+    target = module._periodic_noise_target(
+        x_noisy, x0, sigma_node, box_node, box_node
+    )
+    reconstructed = torch.remainder(x_noisy - sigma_node * box_node * target, box_node)
+
+    assert torch.allclose(reconstructed, x0, atol=1e-6)
+    assert (target.abs() <= 0.5 / sigma_node + 1e-6).all()
 
 
 def test_batch_box_robust_to_3vec_collation():

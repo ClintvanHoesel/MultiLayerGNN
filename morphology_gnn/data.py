@@ -1263,9 +1263,11 @@ class ZOrderedBoxMolecularDataset(Dataset):
     center-of-mass z is **at or below** its z — all molecules higher in z than
     the studied molecule are thrown away. The returned ``Data`` is a graph of
     the kept molecule COMs (nodes = molecules) with a per-node ``target_mask``
-    (True only for the studied molecule), so the diffusion trainer never has to
-    invent a z-frontier itself: it simply keeps the context nodes clean and
-    denoises the target (see ``DiffusionMoleculeModule._corrupt_z_ordered``).
+    marking the target z-block: the studied molecule plus the next-highest
+    ``chunk_size - 1`` molecules below it (so ``chunk_size=1`` is exactly the
+    studied molecule). The diffusion trainer never has to invent a z-frontier
+    or expand the mask itself: it simply keeps the non-target nodes clean and
+    denoises the target block (see ``DiffusionMoleculeModule._corrupt_z_ordered``).
 
     Because every molecule is a sample, the standard random train/val/test split
     (``runs.training_helpers.build_loaders``) draws random molecules across the
@@ -1282,12 +1284,14 @@ class ZOrderedBoxMolecularDataset(Dataset):
         radius: float = 20.0,
         box_key: str = "lattice",
         keep_in_memory: bool = False,
+        chunk_size: int = 1,
     ) -> None:
         if isinstance(h5_paths, str):
             h5_paths = [h5_paths]
         self.h5_paths = list(h5_paths)
         self.radius = radius
         self.box_key = box_key
+        self.chunk_size = max(int(chunk_size), 1)
 
         self.molecular = CombinedBoxMolecularDataset(
             self.h5_paths,
@@ -1339,9 +1343,10 @@ class ZOrderedBoxMolecularDataset(Dataset):
         """One z-ordered sample: the studied molecule + everything at/below its z.
 
         Returns a ``Data`` of the kept molecule COMs with a PBC radius graph,
-        ``box``/``lattice``, and a per-node ``target_mask`` marking exactly the
-        studied molecule. Molecules higher in z than the studied molecule are
-        thrown away — they are the ones the model must learn to generate later.
+        ``box``/``lattice``, and a per-node ``target_mask`` marking the target
+        z-block (the studied molecule plus the next-highest ``chunk_size - 1``
+        molecules). Molecules higher in z than the studied molecule are thrown
+        away — they are the ones the model must learn to generate later.
         """
         fi, mi = self._mapping[idx]
         coms = self._coms[fi]  # (N, 3)
@@ -1358,7 +1363,13 @@ class ZOrderedBoxMolecularDataset(Dataset):
             pos, r=self.radius, lattice=lattice, loop=False
         )
         box, is_orthorhombic = _normalize_lattice(lattice)
-        target_mask = kept == mi  # (k,) bool — True only for the studied molecule
+        # The dataset owns the target-block mask: the studied molecule plus the
+        # next-highest ``chunk_size - 1`` molecules below it (``chunk_size=1``
+        # is exactly the studied molecule). The trainer just reads it.
+        kept_z = coms[kept, 2]
+        target_order = torch.argsort(kept_z, descending=True)
+        target_mask = torch.zeros(len(kept), dtype=torch.bool)
+        target_mask[target_order[: self.chunk_size]] = True
         data = Data(x=x, pos=pos, edge_index=edge_index, y=torch.zeros(1))
         data.box = box.reshape(1, 3).clone()
         data.lattice = lattice.clone()
@@ -1373,6 +1384,7 @@ def get_z_ordered_box_dataset(
     radius: float = 20.0,
     box_key: str = "lattice",
     keep_in_memory: bool = False,
+    chunk_size: int = 1,
 ) -> ZOrderedBoxMolecularDataset:
     """Helper function to instantiate a ZOrderedBoxMolecularDataset."""
     return ZOrderedBoxMolecularDataset(
@@ -1380,6 +1392,7 @@ def get_z_ordered_box_dataset(
         radius=radius,
         box_key=box_key,
         keep_in_memory=keep_in_memory,
+        chunk_size=chunk_size,
     )
 
 

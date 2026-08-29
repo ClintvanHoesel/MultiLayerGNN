@@ -244,6 +244,37 @@ def test_sequential_z_receives_growing_structure_as_context():
         assert seen[4 * k : 4 * (k + 1)] == [k + 1] * 4
 
 
+def test_sequential_z_chunk_size_generates_in_blocks():
+    """chunk_size > 1 reverse-diffuses several new points per step."""
+    mod = _small_module(z_ordered=True, chunk_size=3)
+    species = torch.randint(0, 3, (6,))
+    box = torch.tensor([20.0, 20.0, 100.0])
+    seen: list[int] = []
+    orig = mod.model.forward
+
+    def spy(*args, **kwargs):
+        seen.append(int(kwargs["pos_noisy"].shape[0]))
+        return orig(*args, **kwargs)
+
+    mod.model.forward = spy
+    try:
+        gen = mod.sample_sequential_z(species, box, num_points=6, steps=4, seed=0)
+    finally:
+        mod.model.forward = orig
+
+    assert gen.shape == (6, 3)
+    # Chunk boundaries are z-ordered: every point of chunk 2 is at/above the
+    # max z of chunk 1 (within a chunk the model freely arranges the block).
+    assert (gen[3:, 2] >= gen[:3, 2].max() - 1e-5).all()
+    # two chunks of 3: the graph holds 3 nodes, then 6 nodes, at every step.
+    assert seen == [3] * 4 + [6] * 4
+
+    # a chunk larger than num_points is clamped to a single chunk
+    mod2 = _small_module(z_ordered=True, chunk_size=10)
+    gen2 = mod2.sample_sequential_z(species, box, num_points=6, steps=2, seed=0)
+    assert gen2.shape == (6, 3)
+
+
 # --------------------------------------------------------------------------- #
 # Model per-node time conditioning
 # --------------------------------------------------------------------------- #
@@ -273,6 +304,33 @@ def test_z_ordered_corrupt_keeps_context_clean():
     assert x_noisy.shape == b.pos.shape
     assert edge_index.shape[0] == 2
     assert torch.isfinite(x_noisy).all()
+
+
+def test_z_ordered_corrupt_uses_dataset_target_block():
+    """The trainer noises exactly the dataset-provided target_mask (a block)."""
+    b, _box = _toy_batch()  # each graph: z = [5, 8, 20, 35, 37, 39]
+    # Give each graph a 3-node target block, as ZOrderedBoxMolecularDataset
+    # with chunk_size=3 would: the three highest-z molecules.
+    block = torch.zeros(len(b.pos), dtype=torch.bool)
+    for g in range(b.num_graphs):
+        idx = b.batch == g
+        nodes = idx.nonzero().flatten()
+        z = b.pos[nodes, 2]
+        order = torch.argsort(z, descending=True)
+        block[nodes[order[:3]]] = True
+    b.target_mask = block
+
+    mod = _small_module(z_ordered=True)
+    x_noisy, edge_index, t, eps, mask = mod._corrupt_z_ordered(b)
+    for g in range(b.num_graphs):
+        idx = b.batch == g
+        assert int(mask[idx].sum()) == 3
+        # the target block is the highest-z one; context below stays clean.
+        assert b.pos[~mask & idx, 2].max() <= b.pos[mask & idx, 2].min() + 1e-6
+        assert torch.allclose(x_noisy[~mask & idx], b.pos[~mask & idx], atol=1e-6)
+    assert eps[~mask].abs().sum() == 0
+    assert eps[mask].abs().sum() > 0
+    assert t.shape == (b.num_graphs,)
 
 
 def test_z_ordered_training_loss_over_targets(monkeypatch):

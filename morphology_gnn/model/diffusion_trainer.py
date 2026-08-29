@@ -1,17 +1,19 @@
 """Lightning trainer, sampler and position metrics for the diffusion model.
 
 :class:`DiffusionMoleculeModule` trains :class:`DiffusionMoleculeModel` with an
-epsilon-prediction DDPM objective: every step samples ``t ~ U(0, 1)`` and
-``eps ~ N(0, I)``, noises the clean positions, wraps them into the cell, rebuilds
-the PBC radius graph and minimizes ``MSE(eps_hat, eps)``. Validation runs the
-same loss on a fixed grid of noise levels plus a cheap one-step denoising
-``coord_rmse``.
+epsilon-prediction, variance-exploding (VE) objective: every step samples
+``sigma ~ U(0, 1)`` and ``eps ~ N(0, I)``, adds ``sigma(t) * noise_scale *
+eps`` to the clean positions, wraps them into the cell, rebuilds the PBC radius
+graph and minimizes ``MSE(eps_hat, eps)``. ``noise_scale`` is the (optionally
+per-axis) noise amplitude; the highest-noise, wrapped distribution matches the
+sampling prior. Validation runs the same loss on a fixed grid of noise levels
+plus a cheap one-step denoising ``coord_rmse``.
 
 The module also hosts the reverse sampler (:meth:`DiffusionMoleculeModule.sample`
-/ :meth:`~DiffusionMoleculeModule.sample_many`) — DDPM or deterministic DDIM —
-used for generation at the end of training and by the runner. The radius graph
-is rebuilt from the current (noisy) coordinates at every reverse step and the
-coordinates are kept inside the cell.
+/ :meth:`~DiffusionMoleculeModule.sample_many`) — ancestral or deterministic
+DDIM-style VE updates — used for generation at the end of training and by the
+runner. The radius graph is rebuilt from the current (noisy) coordinates at
+every reverse step and the coordinates are kept inside the cell.
 
 Position metrics (:func:`coord_rmse`, :func:`rdf_hist`, :func:`rdf_mad`,
 :func:`min_pair_dist`) are provided here too; they are rotation/translation
@@ -21,7 +23,7 @@ robust enough for comparing generated conformations with ground-truth frames.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Sequence
 
 import lightning.pytorch as pl
 import torch
@@ -102,13 +104,15 @@ def pair_correlation(
         rmax = (box.min() / 2).item()
     if rmax <= 0:
         raise ValueError(f"rmax must be positive, got {rmax}")
+    if rmax > (box.min() / 2).item():
+        logger.warning(
+            "The set rmax should not be larger than half the minimum box length."
+        )
 
     # Keep the final edge exactly at rmax: expanding the final shell beyond the
     # requested range would make its ideal-gas normalization inconsistent.
     nbins = max(int(rmax / dr), 1)
-    edges = torch.linspace(
-        0.0, rmax, nbins + 1, dtype=pos.dtype, device=pos.device
-    )
+    edges = torch.linspace(0.0, rmax, nbins + 1, dtype=pos.dtype, device=pos.device)
     dist = min_image_pair_distances(pos, box)
     # `torch.histc` does not preserve the input device for all backends.  The
     # explicit bin assignment also makes the treatment of r == rmax clear:
@@ -122,9 +126,7 @@ def pair_correlation(
     n_particles = pos.shape[0]
     # There are N(N-1)/2 unordered pairs in a finite box.  This normalization
     # avoids the small-N bias of the common large-system rho*N/2 expression.
-    expected = (
-        n_particles * max(n_particles - 1, 0) / 2.0 * shell_volumes / box.prod()
-    )
+    expected = n_particles * max(n_particles - 1, 0) / 2.0 * shell_volumes / box.prod()
     return torch.where(expected > 0, counts / expected, torch.zeros_like(counts)), edges
 
 
@@ -158,11 +160,11 @@ def min_pair_dist(pos: torch.Tensor) -> torch.Tensor:
 
 # --- Lightning module --------------------------------------------------------
 class DiffusionMoleculeModule(pl.LightningModule):
-    """LightningModule for epsilon-prediction DDPM training of molecular positions.
+    """LightningModule for VE epsilon-prediction diffusion of molecular positions.
 
     Handles the train/val/test loops, per-split loss + cheap denoising metric
-    logging, the reverse sampler (DDPM / DDIM) and optimization (pluggable
-    optimizer + LR scheduler, same pattern as
+    logging, the reverse sampler (ancestral / DDIM-style VE) and optimization
+    (pluggable optimizer + LR scheduler, same pattern as
     :class:`SimpleLightningMoleculeModule`). All knobs are persisted in
     ``self.hparams`` except ``model`` (passed again to ``load_from_checkpoint``).
     The full resolved run config can be passed via ``config``.
@@ -193,6 +195,19 @@ class DiffusionMoleculeModule(pl.LightningModule):
         sample_steps: int = 100,
         sample_ddim: bool = False,
         sample_eta: float = 0.0,
+        # Characteristic length scale (Angstrom) of the forward noise: at
+        # ``sigma = 1`` the noise is ``noise_scale * eps``.  ``None`` keeps the
+        # per-graph box as the scale (cell-scaled noise, the historical
+        # behaviour).  A scalar sets the same scale in x/y/z; a length-3
+        # sequence sets per-axis scales ``(x, y, z)`` — typically z much
+        # smaller than x/y so the thin-film thickness is preserved.
+        noise_scale: float | Sequence[float] | None = None,
+        # How many new points are SAMPLED at a time in the sequential (+z)
+        # mode. ``1`` keeps the original point-by-point behaviour; ``K``
+        # reverse-diffuses ``K`` new molecules together per sampling step. The
+        # matching training target-block is marked by the z-ordered dataset's
+        # ``target_mask`` (``ZOrderedBoxMolecularDataset(chunk_size=K)``).
+        chunk_size: int = 1,
         z_ordered: bool = False,
         config: dict | None = None,
     ) -> None:
@@ -200,6 +215,19 @@ class DiffusionMoleculeModule(pl.LightningModule):
         self.model = model
         self.noise_schedule = model.noise_schedule  # cached for readability
         self.radius = radius
+        if noise_scale is None:
+            self.noise_scale = None
+        elif isinstance(noise_scale, (int, float)):
+            self.noise_scale = (float(noise_scale),) * 3
+        else:
+            values = tuple(float(v) for v in noise_scale)
+            if len(values) != 3:
+                raise ValueError(
+                    "noise_scale must be a scalar or a length-3 sequence "
+                    f"(x, y, z); got {noise_scale!r}"
+                )
+            self.noise_scale = values
+        self.chunk_size = max(int(chunk_size), 1)
         self.lr = lr
         self.weight_decay = weight_decay
         self.optimizer_class = optimizer_class
@@ -243,27 +271,68 @@ class DiffusionMoleculeModule(pl.LightningModule):
             f"unexpected batch.box shape {tuple(box.shape)}; expected (B, 3)"
         )
 
-    def _corrupt(self, batch: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _periodic_noise_target(
+        x_noisy: torch.Tensor,
+        x0: torch.Tensor,
+        sigma_node: torch.Tensor,
+        scale_node: torch.Tensor,
+        box_node: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the identifiable, minimum-image epsilon target.
+
+        Gaussian noise is necessarily wrapped before it reaches the network.
+        Its original unwrapped epsilon is therefore ambiguous by an arbitrary
+        integer number of box lengths.  The minimum-image displacement from the
+        clean point to the wrapped noisy point is the unique periodic target
+        that reconstructs the clean point and is what the VE reverse update
+        must predict.  ``scale_node`` is the noise amplitude (Angstrom) at
+        ``sigma = 1`` while ``box_node`` is the periodic wrapping period.
+        """
+        disp = x_noisy - x0
+        disp = disp - torch.round(disp / box_node) * box_node
+        return disp / (sigma_node * scale_node).clamp_min(1e-8)
+
+    def _noise_scale_node(self, box_node: torch.Tensor) -> torch.Tensor:
+        """Per-node noise amplitude: the configured (per-axis) scale, or the box."""
+        if self.noise_scale is None:
+            return box_node
+        scale = box_node.new_tensor(self.noise_scale)  # (3,)
+        return scale.unsqueeze(0).expand_as(box_node)
+
+    def _noise_scale_vec(self, box: torch.Tensor) -> torch.Tensor:
+        """Per-axis noise amplitude ``(3,)`` for one graph, or the box if unset."""
+        if self.noise_scale is None:
+            return box
+        return box.new_tensor(self.noise_scale)
+
+    def _corrupt(
+        self, batch: Any
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Noise the clean positions and rebuild the PBC radius graph.
 
         Returns ``(x_noisy, edge_index, t, eps)``: in-cell noisy positions, the
-        graph rebuilt from them, the per-graph timesteps and the raw Gaussian
-        noise. The loss is computed on the unwrapped ``eps`` (standard; the
-        boundary ambiguity after wrapping is negligible).
+        graph rebuilt from them, the per-graph timesteps and the normalized
+        minimum-image noise target.  The target remains well-defined after
+        periodic wrapping, unlike the raw unwrapped Gaussian displacement.
         """
         x0 = batch.pos  # (N, 3)
         B = batch.num_graphs
         device = x0.device
-        t = torch.rand(B, device=device)  # (B,)
+        sigma = torch.rand(B, device=device)  # uniform noise level in [0, 1]
+        t = self.noise_schedule.time_from_sigma(sigma)  # (B,) model time
         eps = torch.randn_like(x0)  # (N, 3)
-        sigma = self.noise_schedule.sigma(t)  # (B,)
         sigma_node = sigma[batch.batch].unsqueeze(-1)  # (N, 1)
-        x_noisy = x0 + sigma_node * eps
         box = self._batch_box(batch)  # (B, 3)
         box_node = box[batch.batch]  # (N, 3)
+        scale_node = self._noise_scale_node(box_node)
+        x_noisy = x0 + sigma_node * scale_node * eps
         x_noisy = torch.remainder(x_noisy, box_node)  # wrap into the cell
         edge_index = rebuild_pbc_edges(x_noisy, batch.batch, box, self.radius)
-        return x_noisy, edge_index, t, eps
+        eps_target = self._periodic_noise_target(
+            x_noisy, x0, sigma_node, scale_node, box_node
+        )
+        return x_noisy, edge_index, t, eps_target
 
     def _corrupt_z_ordered(
         self, batch: Any
@@ -271,11 +340,12 @@ class DiffusionMoleculeModule(pl.LightningModule):
         """Sequential z-ordered corruption — context clean, targets noisy.
 
         Reads the per-node ``target_mask`` supplied by the z-ordered box dataset
-        (the studied molecule of each sample, with every molecule at/below its z
-        kept as clean context): only the marked target nodes are noised at the
-        graph's ``t``, the context stays clean, and the model is asked to predict
-        ``eps`` for the targets only (``mask``). The graph is rebuilt from the
-        noisy coordinates. Returns ``(x_noisy, edge_index, t, eps, mask)``.
+        (a z-block of ``chunk_size`` molecules — the studied molecule plus the
+        next-highest below it — with everything below kept as clean context):
+        only the marked target nodes are noised at the graph's ``t``, the
+        context stays clean, and the model is asked to predict ``eps`` for the
+        targets only (``mask``). The graph is rebuilt from the noisy
+        coordinates. Returns ``(x_noisy, edge_index, t, eps, mask)``.
         """
         x0 = batch.pos  # (N, 3)
         B = batch.num_graphs
@@ -287,19 +357,28 @@ class DiffusionMoleculeModule(pl.LightningModule):
                 "ZOrderedBoxMolecularDataset)"
             )
         mask = mask.to(device).bool()
-        t = torch.rand(B, device=device)  # per-graph target noise level
+        sigma = torch.rand(B, device=device)  # uniform noise level in [0, 1]
+        t = self.noise_schedule.time_from_sigma(sigma)  # (B,) model time
         eps = torch.randn_like(x0) * mask.to(x0.dtype).unsqueeze(-1)  # targets only
-        sigma = self.noise_schedule.sigma(t)  # (B,)
         sigma_node = sigma[batch.batch].unsqueeze(-1)  # (N, 1)
-        x_noisy = x0 + sigma_node * eps  # context: sigma * 0 -> clean
         box = self._batch_box(batch)  # (B, 3)
         box_node = box[batch.batch]  # (N, 3)
+        scale_node = self._noise_scale_node(box_node)
+        x_noisy = x0 + sigma_node * scale_node * eps  # context: eps == 0 -> clean
         x_noisy = torch.remainder(x_noisy, box_node)  # wrap into the cell
         edge_index = rebuild_pbc_edges(x_noisy, batch.batch, box, self.radius)
-        return x_noisy, edge_index, t, eps, mask
+        eps_target = self._periodic_noise_target(
+            x_noisy, x0, sigma_node, scale_node, box_node
+        )
+        eps_target = eps_target * mask.to(x0.dtype).unsqueeze(-1)
+        return x_noisy, edge_index, t, eps_target, mask
 
     def _predict_eps(
-        self, batch: Any, x_noisy: torch.Tensor, edge_index: torch.Tensor, t: torch.Tensor
+        self,
+        batch: Any,
+        x_noisy: torch.Tensor,
+        edge_index: torch.Tensor,
+        t: torch.Tensor,
     ) -> torch.Tensor:
         return self.model(
             x=batch.x,
@@ -328,9 +407,13 @@ class DiffusionMoleculeModule(pl.LightningModule):
             else F.mse_loss(eps_hat, eps)
         )
         self.log(
-            "train_loss", loss,
-            on_step=True, on_epoch=True, prog_bar=True,
-            batch_size=batch.num_graphs, sync_dist=True,
+            "train_loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=batch.num_graphs,
+            sync_dist=True,
         )
         return loss
 
@@ -344,43 +427,57 @@ class DiffusionMoleculeModule(pl.LightningModule):
         """
         losses, rmses = [], []
         box = self._batch_box(batch)
-        mask = (
-            getattr(batch, "target_mask", None)
-            if self.z_ordered
-            else None
-        )
+        mask = None
+        if self.z_ordered:
+            mask = getattr(batch, "target_mask", None)
+            if mask is not None:
+                mask = mask.to(batch.pos.device).bool()
         for tv in self.val_t_grid:
-            t = torch.full(
-                (batch.num_graphs,), float(tv), device=batch.pos.device
-            )
+            t = torch.full((batch.num_graphs,), float(tv), device=batch.pos.device)
             eps = torch.randn_like(batch.pos)
             if mask is not None:
                 eps = eps * mask.to(eps.dtype).unsqueeze(-1)
             sigma = self.noise_schedule.sigma(t)
             sigma_node = sigma[batch.batch].unsqueeze(-1)
-            x_noisy = batch.pos + sigma_node * eps
             box_node = box[batch.batch]
+            scale_node = self._noise_scale_node(box_node)
+            x_noisy = batch.pos + sigma_node * scale_node * eps
             x_noisy = torch.remainder(x_noisy, box_node)
             edge_index = rebuild_pbc_edges(x_noisy, batch.batch, box, self.radius)
             eps_hat = self._predict_eps(batch, x_noisy, edge_index, t)
-            x0_hat = x_noisy - sigma_node * eps_hat  # one-step denoise estimate
+            eps_target = self._periodic_noise_target(
+                x_noisy, batch.pos, sigma_node, scale_node, box_node
+            )
             if mask is not None:
-                losses.append(F.mse_loss(eps_hat[mask], eps[mask]))
+                eps_target = eps_target * mask.to(eps_target.dtype).unsqueeze(-1)
+            x0_hat = torch.remainder(
+                x_noisy - sigma_node * scale_node * eps_hat, box_node
+            )
+            if mask is not None:
+                losses.append(F.mse_loss(eps_hat[mask], eps_target[mask]))
                 rmses.append(
                     coord_rmse(x0_hat[mask], batch.pos[mask], batch.batch[mask])
                 )
             else:
-                losses.append(F.mse_loss(eps_hat, eps))
+                losses.append(F.mse_loss(eps_hat, eps_target))
                 rmses.append(coord_rmse(x0_hat, batch.pos, batch.batch))
         self.log(
-            f"{prefix}_loss", sum(losses) / len(losses),
-            on_step=False, on_epoch=True, prog_bar=True,
-            batch_size=batch.num_graphs, sync_dist=True,
+            f"{prefix}_loss",
+            sum(losses) / len(losses),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=batch.num_graphs,
+            sync_dist=True,
         )
         self.log(
-            f"{prefix}_coord_rmse", sum(rmses) / len(rmses),
-            on_step=False, on_epoch=True, prog_bar=False,
-            batch_size=batch.num_graphs, sync_dist=True,
+            f"{prefix}_coord_rmse",
+            sum(rmses) / len(rmses),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            batch_size=batch.num_graphs,
+            sync_dist=True,
         )
 
     def validation_step(self, batch: Any, batch_idx: int) -> None:
@@ -488,10 +585,24 @@ class DiffusionMoleculeModule(pl.LightningModule):
             if seed is not None
             else None
         )
-        x = torch.rand(N, 3, device=box.device, generator=generator) * box  # in-cell prior
+        x = (
+            torch.rand(N, 3, device=box.device, generator=generator) * box
+        )  # in-cell prior
         batch_vec = torch.zeros(N, dtype=torch.long, device=box.device)
 
-        t_steps = torch.linspace(1.0, 0.0, steps + 1, device=box.device)
+        # Noise amplitude at sigma=1: the configured (per-axis) scale, or the
+        # box if unset.
+        noise_scale = self._noise_scale_vec(box)
+        if self.noise_scale is not None:
+            # A Gaussian prior at the cell centre matches the configured
+            # (smaller-than-box) noise scale; a uniform prior would be far
+            # outside the forward process the model was trained on.
+            x = box / 2 + noise_scale * torch.randn(
+                N, 3, device=box.device, generator=generator
+            )
+
+        sigma_steps = torch.linspace(1.0, 0.0, steps + 1, device=box.device)
+        t_steps = schedule.time_from_sigma(sigma_steps)
         for i in range(steps):
             t_cur = t_steps[i]
             t_next = t_steps[i + 1]
@@ -501,7 +612,8 @@ class DiffusionMoleculeModule(pl.LightningModule):
                 atom_types, x, edge_index, batch_vec, t_cur, box
             )  # (N, 3)
             x = self._reverse_update(
-                x, eps_hat, t_cur, t_next, schedule, ddim, eta, generator
+                x, eps_hat, t_cur, t_next, noise_scale, box,
+                schedule, ddim, eta, generator,
             )
         return torch.remainder(x, box)
 
@@ -511,12 +623,14 @@ class DiffusionMoleculeModule(pl.LightningModule):
         eps_hat: torch.Tensor,
         t_cur: torch.Tensor,
         t_next: torch.Tensor,
+        noise_scale: torch.Tensor,
+        box: torch.Tensor,
         schedule,
         ddim: bool,
         eta: float,
         generator=None,
     ) -> torch.Tensor:
-        """One reverse-diffusion update (DDPM or DDIM) for a (sub)set of nodes.
+        """One VE reverse-diffusion update for a (sub)set of nodes.
 
         The update is pure per-node math — every node's new value depends only
         on its own ``x`` / predicted ``eps`` and the (scalar) schedule
@@ -524,12 +638,16 @@ class DiffusionMoleculeModule(pl.LightningModule):
         (:meth:`_sample_loop`) or to a single newly generated node
         (:meth:`_sequential_z_step`). ``generator`` is optional: when given, all
         posterior Gaussian draws use it (fully seeded, reproducible sampling);
-        otherwise the global RNG is used.
+        otherwise the global RNG is used.  ``noise_scale`` is the noise
+        amplitude at ``sigma = 1`` (Angstrom), kept equal to the training
+        forward process, while ``box`` is the periodic wrapping period that
+        keeps positions inside the cell.
         """
-        ab_cur = schedule.alpha_bar(t_cur)
-        ab_next = schedule.alpha_bar(t_next)
         sig_cur = schedule.sigma(t_cur)
-        x0_hat = (x - sig_cur * eps_hat) / ab_cur.sqrt().clamp_min(1e-8)
+        sig_next = schedule.sigma(t_next)
+        noise_scale = torch.as_tensor(noise_scale, dtype=x.dtype, device=x.device)
+        box = torch.as_tensor(box, dtype=x.dtype, device=x.device)
+        x0_hat = torch.remainder(x - sig_cur * noise_scale * eps_hat, box)
 
         def _noise_like(like: torch.Tensor) -> torch.Tensor:
             if generator is not None:
@@ -537,25 +655,22 @@ class DiffusionMoleculeModule(pl.LightningModule):
             return torch.randn_like(like)
 
         if ddim:
+            # Follow the same predicted noise to the lower-noise marginal.
+            # This has no alpha-bar division, including at t=1.
+            ratio = (sig_next / sig_cur.clamp_min(1e-8)).square()
+            sigma_t = eta * sig_next * torch.sqrt((1.0 - ratio).clamp_min(0.0))
+            eps_coef = torch.sqrt((sig_next.square() - sigma_t.square()).clamp_min(0.0))
+            x_next = x0_hat + eps_coef * noise_scale * eps_hat
             if eta > 0:
-                sigma_t = eta * torch.sqrt(
-                    ((1.0 - ab_next) / (1.0 - ab_cur).clamp_min(1e-8))
-                    * (1.0 - ab_cur / ab_next.clamp_min(1e-8))
-                )
-            else:
-                sigma_t = torch.zeros((), device=x.device)
-            coef = torch.sqrt((1.0 - ab_next - sigma_t**2).clamp_min(0.0))
-            x_next = ab_next.sqrt() * x0_hat + coef * eps_hat
-            if eta > 0:
-                x_next = x_next + sigma_t * _noise_like(x_next)
+                x_next = x_next + sigma_t * noise_scale * _noise_like(x_next)
         else:
-            alpha_cur = (ab_cur / ab_next.clamp_min(1e-8)).clamp_max(1.0)
-            beta = 1.0 - alpha_cur
-            x_next = (x - beta / sig_cur.clamp_min(1e-8) * eps_hat) / alpha_cur.sqrt()
-            post_std = torch.sqrt(
-                beta * (1.0 - ab_next) / (1.0 - ab_cur).clamp_min(1e-8)
-            )
-            x_next = x_next + post_std * _noise_like(x_next)
+            # Exact Gaussian posterior q(x_next | x_t, x0_hat) for the VE
+            # marginals x_t = x0 + sigma(t) * noise_scale * eps.
+            ratio = (sig_next / sig_cur.clamp_min(1e-8)).square()
+            x_next = ratio * x + (1.0 - ratio) * x0_hat
+            post_std = sig_next * torch.sqrt((1.0 - ratio).clamp_min(0.0))
+            if float(post_std) > 0:
+                x_next = x_next + post_std * noise_scale * _noise_like(x_next)
         return x_next
 
     def _predict_eps_single(
@@ -623,47 +738,65 @@ class DiffusionMoleculeModule(pl.LightningModule):
         z_frontier: float,
         generator,
     ) -> torch.Tensor:
-        """Reverse-diffuse ONE new molecule with the structure-so-far frozen.
+        """Reverse-diffuse a CHUNK of new molecules with the structure frozen.
 
-        The new node is initialized inside the cell with its z uniform in
-        ``[z_frontier, box_z]`` (the ordering constraint is already respected by
-        the prior), then every reverse step denoises ONLY the new node while the
-        previously generated molecules (``pos_ctx`` / ``type_ctx``) stay fixed
-        in the graph as conditioning context — exactly the input the model saw
-        during z-ordered training (context at clean positions, one noisy node,
-        all nodes sharing the graph's ``t``). After each step the new node is
-        wrapped back into the cell and its z clamped to ``>= z_frontier``, so
-        the constraint holds throughout sampling rather than only as
-        post-processing.
+        ``species_new`` holds ``K`` species (a chunk).  The ``K`` new nodes are
+        initialized inside the cell with their z uniform in
+        ``[z_frontier, box_z]`` (the ordering constraint is respected by the
+        prior), then every reverse step denoises ONLY those ``K`` nodes while
+        the previously generated molecules (``pos_ctx`` / ``type_ctx``) stay
+        fixed in the graph as conditioning context — exactly the input the model
+        saw during chunked z-ordered training (context at clean positions, ``K``
+        noisy target nodes, all nodes sharing the graph's ``t``).  After each
+        step the new nodes are wrapped back into the cell and their z clamped to
+        ``>= z_frontier``.  ``K == 1`` is the original point-by-point update.
         """
+        K = species_new.shape[0]
         k = pos_ctx.shape[0]
         box_z = float(box[2])
         if z_frontier > box_z:
             logger.warning(
                 "sequential_z: z-frontier %.3f exceeds the cell height %.3f — "
-                "no room above the current structure; the next molecule is "
+                "no room above the current structure; the next molecules are "
                 "pinned to the top of the cell",
                 z_frontier,
                 box_z,
             )
         lo = min(z_frontier, box_z)
 
-        # In-cell prior respecting the ordering constraint at initialization.
-        x_new = torch.empty(1, 3, device=box.device)
-        x_new[0, 0] = box[0] * torch.rand(1, device=box.device, generator=generator)
-        x_new[0, 1] = box[1] * torch.rand(1, device=box.device, generator=generator)
-        x_new[0, 2] = lo + (box_z - lo) * torch.rand(
-            1, device=box.device, generator=generator
-        )
+        # Noise amplitude at sigma=1: the configured (per-axis) scale, or the
+        # box if unset.
+        noise_scale = self._noise_scale_vec(box)
 
-        types_all = torch.cat([type_ctx, species_new])  # (k + 1,)
-        batch_vec = torch.zeros(k + 1, dtype=torch.long, device=box.device)
+        # In-cell prior respecting the ordering constraint at initialization.
+        if self.noise_scale is None:
+            # Uninformative prior: anywhere in the cell at/above the frontier.
+            x_new = torch.empty(K, 3, device=box.device)
+            x_new[:, 0] = box[0] * torch.rand(K, device=box.device, generator=generator)
+            x_new[:, 1] = box[1] * torch.rand(K, device=box.device, generator=generator)
+            x_new[:, 2] = lo + (box_z - lo) * torch.rand(
+                K, device=box.device, generator=generator
+            )
+        else:
+            # Localised prior: near the most recently placed point, with the
+            # configured noise scale, so the reverse process starts inside the
+            # forward-noise support the model was trained on.
+            anchor = pos_ctx[-1:] if pos_ctx.numel() else (box / 2).reshape(1, 3)
+            x_new = anchor + noise_scale * torch.randn(
+                K, 3, device=box.device, generator=generator
+            )
+            x_new = torch.remainder(x_new, box)
+            x_new[:, 2] = x_new[:, 2].clamp(lo, box_z)
+
+        species_new = species_new.reshape(-1)  # (K,)
+        types_all = torch.cat([type_ctx, species_new])  # (k + K,)
+        batch_vec = torch.zeros(k + K, dtype=torch.long, device=box.device)
         box_graph = box.unsqueeze(0)  # (1, 3) per-graph box
 
         for i in range(steps):
             t_cur = t_steps[i]
             t_next = t_steps[i + 1]
-            x_all = torch.cat([pos_ctx, x_new])  # (k + 1, 3), in-cell
+            x_all = torch.cat([pos_ctx, x_new])  # (k + K, 3), in-cell
             edge_index = radius_graph_pbc(x_all, r=radius, lattice=box, loop=False)
             eps_hat = self.model(
                 x=types_all,
@@ -672,15 +805,16 @@ class DiffusionMoleculeModule(pl.LightningModule):
                 batch=batch_vec,
                 t=t_cur.unsqueeze(0),
                 box=box_graph,
-            )  # (k + 1, 3)
-            eps_new = eps_hat[-1:]  # (1, 3) — denoise only the new node
+            )  # (k + K, 3)
+            eps_new = eps_hat[-K:]  # (K, 3) — denoise only the new nodes
             x_new = self._reverse_update(
-                x_new, eps_new, t_cur, t_next, schedule, ddim, eta, generator
+                x_new, eps_new, t_cur, t_next, noise_scale, box,
+                schedule, ddim, eta, generator,
             )
             # Hard z-ordering / in-cell constraint during sampling.
             x_new = torch.remainder(x_new, box)
-            x_new[0, 2] = x_new[0, 2].clamp(lo, box_z)
-        return x_new  # (1, 3), in-cell, z in [z_frontier, box_z]
+            x_new[:, 2] = x_new[:, 2].clamp(lo, box_z)
+        return x_new  # (K, 3), in-cell, z >= z_frontier
 
     @torch.no_grad()
     def sample_sequential_z(
@@ -699,20 +833,21 @@ class DiffusionMoleculeModule(pl.LightningModule):
         seed: int | None = None,
         device: torch.device | str | None = None,
     ) -> torch.Tensor:
-        """Generate molecule positions point-by-point, each above the previous in +z.
+        """Generate molecule positions in +z, ``chunk_size`` at a time.
 
         Unlike :meth:`sample` — which reverse-diffuses every node of a fixed
-        structure simultaneously — this generator places the molecules one at a
-        time along +z:
+        structure simultaneously — this generator places ``self.chunk_size``
+        molecules per step along +z:
 
         * an empty structure is (optionally) seeded with ``initial_pos`` /
           ``initial_types`` (fixed context, never updated);
         * the current z-frontier is ``max(bottom_z_exclusion, max z so far)``
           plus ``z_step`` separation when given;
-        * the next molecule is reverse-diffused with every previously generated
-          molecule kept fixed in the graph as context, its COM z-coordinate
-          constrained to stay at/above the frontier at every sampling step;
-        * the molecule is appended and the frontier advances.
+        * a chunk of ``self.chunk_size`` new molecules is reverse-diffused with
+          every previously generated molecule kept fixed in the graph as
+          context, their COM z-coordinates constrained to stay at/above the
+          frontier at every sampling step;
+        * the chunk is appended and the frontier advances.
 
         The constraint is enforced during diffusion sampling (initialization in
         ``[z_frontier, box_z]`` plus a per-step z clamp), never as a
@@ -798,12 +933,15 @@ class DiffusionMoleculeModule(pl.LightningModule):
                 if seed is not None
                 else None
             )
-            t_steps = torch.linspace(1.0, 0.0, steps + 1, device=box.device)
+            sigma_steps = torch.linspace(1.0, 0.0, steps + 1, device=box.device)
+            t_steps = schedule.time_from_sigma(sigma_steps)
             generated: list[torch.Tensor] = []
-            for k in range(num_points):
+            chunk_size = self.chunk_size
+            for start in range(0, num_points, chunk_size):
+                k_chunk = min(chunk_size, num_points - start)
                 z_frontier = self._z_frontier(pos_ctx, bottom_z_exclusion, z_step)
-                x_new = self._sequential_z_step(
-                    atom_types[k : k + 1],
+                x_chunk = self._sequential_z_step(
+                    atom_types[start : start + k_chunk],
                     type_ctx,
                     pos_ctx,
                     box,
@@ -815,10 +953,12 @@ class DiffusionMoleculeModule(pl.LightningModule):
                     t_steps,
                     z_frontier,
                     generator,
-                )  # (1, 3)
-                pos_ctx = torch.cat([pos_ctx, x_new])
-                type_ctx = torch.cat([type_ctx, atom_types[k : k + 1]])
-                generated.append(x_new)
+                )  # (k_chunk, 3)
+                pos_ctx = torch.cat([pos_ctx, x_chunk])
+                type_ctx = torch.cat(
+                    [type_ctx, atom_types[start : start + k_chunk]]
+                )
+                generated.append(x_chunk)
             if generated:
                 return torch.cat(generated, dim=0)  # (num_points, 3)
             return torch.empty(0, 3, device=box.device)
@@ -835,7 +975,7 @@ class DiffusionMoleculeModule(pl.LightningModule):
         seed: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Generate ``n`` independent point-by-point (z-ordered) structures.
+        """Generate ``n`` independent chunked (z-ordered) structures.
 
         Returns ``(n, num_points, 3)`` where every structure is produced by
         :meth:`sample_sequential_z` with its own seed (``seed + i``) — i.e.

@@ -6,9 +6,10 @@ periodic cell — conditioned on the atom types, the cell, and a noise level
 displacements and the radius graph is rebuilt from the (noisy) coordinates at
 every step by the caller (see :mod:`morphology_gnn.model.diffusion_trainer`).
 
-Trained with an epsilon-parameterized DDPM (cosine schedule by default): the
-forward process is ``x_t = x_0 + sigma(t) * eps`` with ``eps ~ N(0, I)`` and the
-model predicts ``eps`` from ``x_t``. Equivariance is exact SE(3) via an
+Trained with an epsilon-parameterized, variance-exploding periodic diffusion
+process (cosine schedule by default): the forward process is
+``x_t = x_0 + sigma(t) * box * eps`` with ``eps ~ N(0, I)`` and the model
+predicts the equivalent minimum-image ``eps`` from ``x_t``. Equivariance is exact SE(3) via an
 EGNN-style directional noise head (no spherical harmonics / Wigner-D): the GNN
 backbone produces an *invariant* hidden state ``h`` and the head combines it
 with minimum-image unit vectors, so the predicted noise field rotates with the
@@ -220,13 +221,14 @@ class EquivariantNoiseHead(nn.Module):
 
 
 class NoiseSchedule(nn.Module):
-    """Continuous-time noise schedule (epsilon-parameterization).
+    """Continuous-time variance-exploding noise schedule.
 
-    ``alpha_bar(t)`` is the retained-signal fraction at ``t in [0, 1]`` and
-    ``sigma(t) = sqrt(1 - alpha_bar(t))`` the injected-noise standard deviation,
-    so the forward process is ``x_t = x_0 + sigma(t) * eps`` with
-    ``eps ~ N(0, I)``. ``sigma(0) = 0`` (clean data) and ``sigma(1) = 1`` (pure
-    noise), with monotone interpolation in between.
+    ``sigma(t) = sqrt(1 - alpha_bar(t))`` is the normalized noise standard
+    deviation used by the periodic VE process ``x_t = x_0 + sigma(t) * box *
+    eps``.  ``alpha_bar`` is retained as a convenient schedule parameterization
+    and backwards-compatible public helper; it is not a VP signal multiplier.
+    ``sigma(0) = 0`` (clean data) and ``sigma(1) = 1`` (cell-scale noise), with
+    monotone interpolation in between.
     """
 
     SCHEDULES = ("cosine", "linear")
@@ -249,6 +251,18 @@ class NoiseSchedule(nn.Module):
     def sigma(self, t: torch.Tensor) -> torch.Tensor:
         """Noise standard deviation at time ``t``."""
         return torch.sqrt((1.0 - self.alpha_bar(t)).clamp_min(0.0))
+
+    def time_from_sigma(self, sigma: torch.Tensor) -> torch.Tensor:
+        """Inverse schedule for a noise level in ``[0, 1]``.
+
+        Reverse samplers use equally spaced noise levels rather than equally
+        spaced times.  This avoids spending most cosine-schedule steps at the
+        almost-unchanged high-noise endpoint.
+        """
+        sigma = torch.as_tensor(sigma).clamp(0.0, 1.0)
+        if self.kind == "cosine":
+            return 2.0 * torch.asin(sigma) / math.pi
+        return sigma.square()
 
     def snr(self, t: torch.Tensor) -> torch.Tensor:
         """Signal-to-noise ratio ``alpha_bar / (1 - alpha_bar)``."""

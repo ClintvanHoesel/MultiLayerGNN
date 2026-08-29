@@ -1,7 +1,7 @@
 """Train an SE(3)-equivariant diffusion model for molecular positions.
 
 Config-driven runner for :class:`DiffusionMoleculeModel` /
-:class:`DiffusionMoleculeModule`: trains an epsilon-prediction DDPM denoiser on
+:class:`DiffusionMoleculeModule`: trains an epsilon-prediction periodic VE denoiser on
 per-atom coordinates (a molecule conformation inside its periodic cell), then
 generates new conformations conditioned on a few reference frames and reports
 position metrics (coord RMSE, pair-correlation mean-abs-diff, min-pair
@@ -435,6 +435,12 @@ def build_diffusion_module(model, config: dict) -> DiffusionMoleculeModule:
     kw["sample_steps"] = sampling_cfg.get("steps", 100)
     kw["sample_ddim"] = sampling_cfg.get("ddim", False)
     kw["sample_eta"] = sampling_cfg.get("eta", 0.0)
+    # Forward-noise amplitude at sigma=1. None keeps the per-graph box
+    # (cell-scaled noise); a scalar or a length-3 (x, y, z) list decouples the
+    # noise from the cell (e.g. z much smaller than x/y for thin films).
+    kw["noise_scale"] = config.get("diffusion", {}).get("noise_scale")
+    # How many points are learned/sampled at a time in sequential (+z) mode.
+    kw["chunk_size"] = int(train_cfg.get("chunk_size", 1))
     # The box_zordered dataset provides per-molecule samples with a target_mask
     # (the studied molecule; context = molecules at/below its z), so z-ordered
     # training is the natural fit — enabled automatically unless overridden
@@ -518,6 +524,7 @@ def build_dataset(config: dict):
             data_files,
             radius=config["radius"],
             keep_in_memory=config.get("keep_in_memory", False),
+            chunk_size=int(config.get("training", {}).get("chunk_size", 1)),
         )
     return CombinedH5MolecularDataset(
         data_files, config["target"], radius=config["radius"]

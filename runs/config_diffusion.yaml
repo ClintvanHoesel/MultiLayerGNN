@@ -1,6 +1,7 @@
 # Diffusion position-generator configuration (box "morphology" mode).
 #
-# Trains an EGNN-style SE(3)-equivariant denoiser (epsilon-prediction DDPM) on
+# Trains an EGNN-style SE(3)-equivariant denoiser (epsilon-prediction periodic
+# variance-exploding diffusion) on
 # molecule center-of-mass positions: each sample is one periodic box of
 # N molecules, and the model learns to denoise / generate the N center-of-mass
 # coordinates (molecules/position) conditioned on the molecule species + cell —
@@ -87,6 +88,11 @@ model:
 diffusion:
   # Noise schedule for the forward process: cosine (default) or linear.
   schedule: cosine
+  # Forward-noise amplitude (Angstrom) at sigma=1. null keeps the per-graph box
+  # (cell-scaled noise). A scalar sets the same scale in x/y/z; a length-3 list
+  # sets per-axis scales [x, y, z] — set z much smaller than x/y to keep the
+  # thin-film thickness stable during diffusion.
+  noise_scale: null
 
 training:
   batch_size: 32
@@ -112,11 +118,17 @@ training:
   # the target. null = auto: true for dataset=box_zordered (per-molecule samples
   # with a target_mask); false keeps the original whole-box corruption.
   z_ordered: null
+  # How many molecules are learned and sampled at a time in sequential (+z)
+  # mode. 1 = original point-by-point; K > 1 learns and generates a contiguous
+  # z-block of K molecules per step. The z-ordered dataset (box_zordered)
+  # marks the target block in its per-sample target_mask; the sampler
+  # reverse-diffuses K points together per step.
+  chunk_size: 1
 
 sampling:
   # Number of reverse-diffusion steps used when generating structures.
   steps: 100
-  # Deterministic DDIM sampling instead of the stochastic DDPM update.
+  # Deterministic DDIM-style VE sampling instead of the stochastic ancestral update.
   ddim: false
   # DDIM stochasticity (only when ddim is true; 0 = fully deterministic).
   eta: 0.0

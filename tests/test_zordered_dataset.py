@@ -99,6 +99,35 @@ def test_zordered_target_mask_collates_in_batch(tmp_path):
     ] == [1, 1, 1]
 
 
+def test_zordered_chunk_size_marks_target_block(tmp_path):
+    """chunk_size>1 marks a highest-z target block, owned by the dataset."""
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=8, seed=1)
+    ds = ZOrderedBoxMolecularDataset(p, radius=10.0, chunk_size=3)
+    assert len(ds) == 8
+    for idx in range(len(ds)):
+        d = ds[idx]
+        kept = len(d.pos)
+        assert int(d.target_mask.sum()) == min(3, kept)
+        # the target block is the highest-z kept molecules
+        if (~d.target_mask).any():
+            assert (
+                d.pos[~d.target_mask, 2].max()
+                <= d.pos[d.target_mask, 2].min() + 1e-6
+            )
+
+
+def test_zordered_chunk_size_block_collates_in_batch(tmp_path):
+    """A block target_mask collates through PyG batching unchanged."""
+    p = _make_box_file(str(tmp_path / "box.hdf5"), n=6, seed=1)
+    ds = ZOrderedBoxMolecularDataset(p, radius=10.0, chunk_size=2)
+    batch = Batch.from_data_list([ds[2], ds[5]])
+    assert batch.target_mask.shape == (len(batch.pos),)
+    counts = [
+        int(batch.target_mask[batch.batch == g].sum()) for g in range(batch.num_graphs)
+    ]
+    assert counts == [min(2, len(ds[2].pos)), min(2, len(ds[5].pos))]
+
+
 def test_zordered_val_test_random_molecules_across_film(tmp_path):
     """A random per-molecule split puts val/test molecules across the film."""
     p = _make_box_file(str(tmp_path / "box.hdf5"), n=48, seed=4)
