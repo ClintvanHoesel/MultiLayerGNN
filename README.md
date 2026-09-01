@@ -1,6 +1,7 @@
 # MultiLayerGNN
 
 THIS REPOSITORY IS A WORK IN PROGRESS.
+POSTPONED (hopefully) TEMPORARILY AWAITING MORE TRAINING DATA.
 
 This repository contains my work on a graph neural network that bridges
 molecular and morphology length scales. I am interested in the range from a
